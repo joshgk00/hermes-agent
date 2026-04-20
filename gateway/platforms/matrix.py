@@ -27,6 +27,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 
 from html import escape as _html_escape
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 try:
     from mautrix.types import (
@@ -128,6 +129,13 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+
+# MSC3381 poll cache. Lives alongside the crypto store but in its own
+# file so it's readable by agent tools without touching crypto state.
+# Only the long-lived gateway adapter writes to this (short-lived send
+# adapters like the polls device skip it — they're not in rooms long
+# enough to see responses anyway).
+_POLL_CACHE_DB_PATH = _STORE_DIR.parent / "polls_cache.db"
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -261,6 +269,45 @@ def check_matrix_requirements() -> bool:
     return True
 
 
+class _CryptoHealthFilter(logging.Filter):
+    """Watches ``mau.crypto`` logs for signals that our own device is broken.
+
+    When the bot's device has an invalid self-signing signature on the
+    homeserver, or is missing cross-signing, peers (including Element X)
+    refuse to share Megolm sessions with us — clients then see "Waiting
+    for this message". These conditions are logged at WARNING by mautrix,
+    which is too quiet to notice before users do.
+
+    This filter promotes records about *our own* device_id to ERROR and
+    increments counters the caller can use for a post-startup health gate.
+    """
+
+    _BAD_SIG_RE = re.compile(r"Invalid signature for (\S+) of")
+    _NOT_CROSSIGNED_RE = re.compile(r"Device \S+/(\S+) isn't cross-signed")
+
+    def __init__(self, device_id: str) -> None:
+        super().__init__()
+        self.device_id = device_id
+        self.invalid_signature_count = 0
+        self.not_cross_signed_count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        match = self._BAD_SIG_RE.search(msg) or self._NOT_CROSSIGNED_RE.search(msg)
+        if match and match.group(1) == self.device_id:
+            if "Invalid signature" in msg:
+                self.invalid_signature_count += 1
+            else:
+                self.not_cross_signed_count += 1
+            record.levelno = logging.ERROR
+            record.levelname = "ERROR"
+        return True
+
+
 class _CryptoStateStore:
     """Adapter that satisfies the mautrix crypto StateStore interface.
 
@@ -317,8 +364,27 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_DEVICE_ID", ""
         )
 
+        # Per-adapter crypto store path override. The module-level default
+        # (_STORE_DIR) is shared, but the mautrix crypto schema keys
+        # crypto_account by account_id alone — so two adapters for the
+        # same user but different devices will clobber each other's olm
+        # account in the same store. Callers that want a second device
+        # (e.g., a dedicated "Hermes Polls" device) must pass a distinct
+        # store_dir here to get an isolated crypto.db.
+        _override_dir = config.extra.get("store_dir")
+        self._store_dir = Path(_override_dir) if _override_dir else _STORE_DIR
+        self._crypto_db_path = self._store_dir / "crypto.db"
+
+        # Poll response cache: only the long-lived gateway adapter writes
+        # to this. Short-lived send adapters (polls device) use
+        # store_dir overrides and skip caching — they're not online to
+        # receive Megolm keys for votes anyway.
+        self._poll_cache_enabled: bool = _override_dir is None
+        self._poll_cache_db_path = _POLL_CACHE_DB_PATH
+
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
+        self._crypto_health: Optional[_CryptoHealthFilter] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._closing = False
         self._startup_ts: float = 0.0
@@ -481,7 +547,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: server has different identity keys for device %s — "
                     "local crypto state is stale. Delete %s and restart.",
                     client.device_id,
-                    _CRYPTO_DB_PATH,
+                    self._crypto_db_path,
                 )
                 return False
 
@@ -531,7 +597,7 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
 
         # Ensure store dir exists for E2EE key persistence.
-        _STORE_DIR.mkdir(parents=True, exist_ok=True)
+        self._store_dir.mkdir(parents=True, exist_ok=True)
 
         # Create the HTTP API layer.
         client_session = _create_matrix_session(self._proxy_url)
@@ -567,8 +633,33 @@ class MatrixAdapter(BasePlatformAdapter):
                     self._user_id = str(resolved_user_id)
                     client.mxid = UserID(self._user_id)
 
-                # Prefer user-configured device_id for stable E2EE identity.
-                effective_device_id = self._device_id or resolved_device_id
+                # Reconcile MATRIX_DEVICE_ID (env) against the device the
+                # access token is actually bound to on the server.
+                # Silently overriding client.device_id when they disagree
+                # leads to key-upload rejection ("Provided device_id in
+                # device_keys does not match that of the authenticated
+                # user device") and a silently broken E2EE startup.
+                # Fail fast with a clear message instead.
+                if (
+                    self._device_id
+                    and resolved_device_id
+                    and self._device_id != resolved_device_id
+                ):
+                    logger.error(
+                        "Matrix: MATRIX_DEVICE_ID=%r disagrees with the "
+                        "device the access token is bound to on the "
+                        "homeserver (%r). Refusing to start to avoid a "
+                        "silently broken E2EE session. Either unset "
+                        "MATRIX_DEVICE_ID (recommended — let the token's "
+                        "real device flow through) or set it to %r.",
+                        self._device_id,
+                        resolved_device_id,
+                        resolved_device_id,
+                    )
+                    await api.session.close()
+                    return False
+
+                effective_device_id = resolved_device_id or self._device_id
                 if effective_device_id:
                     client.device_id = effective_device_id
 
@@ -622,10 +713,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 from mautrix.crypto.store.asyncpg import PgCryptoStore
                 from mautrix.util.async_db import Database
 
-                _STORE_DIR.mkdir(parents=True, exist_ok=True)
+                self._store_dir.mkdir(parents=True, exist_ok=True)
 
                 # Remove legacy pickle file from pre-SQLite era.
-                legacy_pickle = _STORE_DIR / "crypto_store.pickle"
+                legacy_pickle = self._store_dir / "crypto_store.pickle"
                 if legacy_pickle.exists():
                     logger.info(
                         "Matrix: removing legacy crypto_store.pickle (migrated to SQLite)"
@@ -634,14 +725,20 @@ class MatrixAdapter(BasePlatformAdapter):
 
                 # Open SQLite-backed crypto store.
                 crypto_db = Database.create(
-                    f"sqlite:///{_CRYPTO_DB_PATH}",
+                    f"sqlite:///{self._crypto_db_path}",
                     upgrade_table=PgCryptoStore.upgrade_table,
                 )
                 await crypto_db.start()
                 self._crypto_db = crypto_db
 
                 _acct_id = self._user_id or "hermes"
-                _pickle_key = f"{_acct_id}:{self._device_id or 'default'}"
+                # Pickle key is derived from account_id only.  Do NOT mix
+                # in device_id / MATRIX_DEVICE_ID — if that env var ever
+                # changes between runs the stored olm account can't be
+                # unpickled and mautrix raises BAD_ACCOUNT_KEY, bricking
+                # E2EE silently. Account-scoped keying is sufficient;
+                # device identity lives inside the olm account itself.
+                _pickle_key = _acct_id
                 crypto_store = PgCryptoStore(
                     account_id=_acct_id,
                     pickle_key=_pickle_key,
@@ -766,9 +863,16 @@ class MatrixAdapter(BasePlatformAdapter):
                 client.crypto = olm
                 logger.info(
                     "Matrix: E2EE enabled (store: %s%s)",
-                    str(_CRYPTO_DB_PATH),
+                    str(self._crypto_db_path),
                     f", device_id={client.device_id}" if client.device_id else "",
                 )
+
+                # Install a filter on mau.crypto to promote "Invalid
+                # signature" / "isn't cross-signed" warnings about our
+                # own device to ERROR, and track counts for a post-
+                # startup health gate (see below).
+                self._crypto_health = _CryptoHealthFilter(str(client.device_id))
+                logging.getLogger("mau.crypto").addFilter(self._crypto_health)
             except Exception as exc:
                 logger.error(
                     "Matrix: failed to create E2EE client: %s. %s",
@@ -788,6 +892,29 @@ class MatrixAdapter(BasePlatformAdapter):
         client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message)
         client.add_event_handler(EventType.REACTION, self._on_reaction)
         client.add_event_handler(IntEvt.INVITE, self._on_invite)
+
+        # MSC3381 poll events — tracked only by the long-lived main
+        # adapter (self._poll_cache_enabled). The handlers are cheap
+        # no-ops when disabled.
+        if self._poll_cache_enabled:
+            try:
+                self._init_poll_cache_db()
+                poll_start_type = EventType(
+                    "org.matrix.msc3381.poll.start", t_class=EventType.Class.MESSAGE
+                )
+                poll_response_type = EventType(
+                    "org.matrix.msc3381.poll.response", t_class=EventType.Class.MESSAGE
+                )
+                poll_end_type = EventType(
+                    "org.matrix.msc3381.poll.end", t_class=EventType.Class.MESSAGE
+                )
+                client.add_event_handler(poll_start_type, self._on_poll_start)
+                client.add_event_handler(poll_response_type, self._on_poll_response)
+                client.add_event_handler(poll_end_type, self._on_poll_end)
+                logger.info("Matrix: poll cache enabled (db: %s)", self._poll_cache_db_path)
+            except Exception as exc:
+                logger.error("Matrix: failed to enable poll cache: %s", exc)
+                self._poll_cache_enabled = False
 
         # Initial sync to catch up, then start background sync.
         self._startup_ts = time.time()
@@ -835,6 +962,27 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Matrix: initial key share failed: %s", exc)
 
+        # Post-startup crypto health gate.  If the initial sync produced
+        # any signature/cross-signing failures against our own device,
+        # every encrypted message we send will land as "Waiting for this
+        # message" on peers — refuse to pretend things are fine.
+        if self._crypto_health is not None:
+            bad_sig = self._crypto_health.invalid_signature_count
+            not_cs = self._crypto_health.not_cross_signed_count
+            if bad_sig or not_cs:
+                logger.error(
+                    "Matrix: crypto health check FAILED for device %s "
+                    "(invalid_signature=%d, not_cross_signed=%d). Peers "
+                    "will see 'Waiting for this message'. Fix: sign out "
+                    "this device on the homeserver, generate a fresh "
+                    "access token, delete %s, and restart with "
+                    "MATRIX_RECOVERY_KEY set.",
+                    self._crypto_health.device_id,
+                    bad_sig,
+                    not_cs,
+                    self._crypto_db_path,
+                )
+
         # Start the sync loop.
         self._sync_task = asyncio.create_task(self._sync_loop())
         self._mark_connected()
@@ -857,6 +1005,14 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self._crypto_db.stop()
             except Exception as exc:
                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+
+        # Remove crypto health filter so repeated connects don't stack.
+        if self._crypto_health is not None:
+            try:
+                logging.getLogger("mau.crypto").removeFilter(self._crypto_health)
+            except Exception:
+                pass
+            self._crypto_health = None
 
         if self._client:
             try:
@@ -963,6 +1119,351 @@ class MatrixAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(exc))
 
         return SendResult(success=True, message_id=last_event_id)
+
+    async def send_poll(
+        self,
+        chat_id: str,
+        question: str,
+        options: List[str],
+        *,
+        kind: str = "disclosed",
+        max_selections: int = 1,
+        thread_id: Optional[str] = None,
+    ) -> SendResult:
+        """Send an MSC3381 poll. Encrypts via mautrix when the room is E2EE.
+
+        ``kind`` is "disclosed" (results visible while open) or "undisclosed"
+        (results only visible after the poll ends). ``max_selections`` caps
+        how many answers a voter can pick.
+        """
+        if not question or not options:
+            return SendResult(success=False, error="poll requires question and options")
+        if not (1 <= max_selections <= len(options)):
+            return SendResult(
+                success=False,
+                error=f"max_selections must be between 1 and {len(options)}",
+            )
+        if kind not in ("disclosed", "undisclosed"):
+            return SendResult(success=False, error=f"unknown poll kind: {kind}")
+
+        import uuid
+
+        # Pre-generate answer IDs so the cache write after send uses
+        # the same UUIDs voters will reference in their response events.
+        answer_ids = [str(uuid.uuid4()) for _ in options]
+        answer_payload = [
+            {"id": answer_ids[i], "org.matrix.msc1767.text": opt}
+            for i, opt in enumerate(options)
+        ]
+
+        poll_start_content: Dict[str, Any] = {
+            "org.matrix.msc3381.poll.start": {
+                "kind": f"org.matrix.msc3381.poll.{kind}",
+                "max_selections": max_selections,
+                "question": {
+                    "org.matrix.msc1767.text": question,
+                    "body": question,
+                    "msgtype": "m.text",
+                },
+                "answers": answer_payload,
+            },
+            # Fallback body for clients that don't render polls.
+            "body": f"{question}\n" + "\n".join(f"- {o}" for o in options),
+            "msgtype": "m.text",
+        }
+
+        if thread_id:
+            poll_start_content["m.relates_to"] = {
+                "rel_type": "m.thread",
+                "event_id": thread_id,
+                "is_falling_back": True,
+            }
+
+        poll_start_type = EventType(
+            "org.matrix.msc3381.poll.start",
+            t_class=EventType.Class.MESSAGE,
+        )
+
+        try:
+            event_id = await asyncio.wait_for(
+                self._client.send_message_event(
+                    RoomID(chat_id),
+                    poll_start_type,
+                    poll_start_content,
+                ),
+                timeout=45,
+            )
+            logger.info("Matrix: sent poll event %s to %s", event_id, chat_id)
+            # Record the poll we just sent to the shared cache so the
+            # results tool can find it. We know the question/options
+            # because we just composed them — no need to round-trip
+            # through the main gateway's decrypt path (which fails
+            # silently when Megolm keys aren't shared to an
+            # unverified device).
+            await asyncio.to_thread(
+                self._write_sent_poll_to_cache,
+                str(event_id),
+                chat_id,
+                question,
+                answer_payload,
+                kind,
+                max_selections,
+            )
+            return SendResult(success=True, message_id=str(event_id))
+        except Exception as exc:
+            # Retry once after a key share — same pattern as send().
+            if self._encryption and getattr(self._client, "crypto", None):
+                try:
+                    await self._client.crypto.share_keys()
+                    event_id = await asyncio.wait_for(
+                        self._client.send_message_event(
+                            RoomID(chat_id),
+                            poll_start_type,
+                            poll_start_content,
+                        ),
+                        timeout=45,
+                    )
+                    logger.info(
+                        "Matrix: sent poll event %s to %s (after key share)",
+                        event_id,
+                        chat_id,
+                    )
+                    await asyncio.to_thread(
+                        self._write_sent_poll_to_cache,
+                        str(event_id),
+                        chat_id,
+                        question,
+                        list(options),
+                        kind,
+                        max_selections,
+                    )
+                    return SendResult(success=True, message_id=str(event_id))
+                except Exception as retry_exc:
+                    logger.error(
+                        "Matrix: failed to send poll to %s after retry: %s",
+                        chat_id,
+                        retry_exc,
+                    )
+                    return SendResult(success=False, error=str(retry_exc))
+            logger.error("Matrix: failed to send poll to %s: %s", chat_id, exc)
+            return SendResult(success=False, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # Poll cache (MSC3381)
+    # ------------------------------------------------------------------
+
+    def _init_poll_cache_db(self) -> None:
+        """Create polls_cache.db tables if missing. Called once at connect."""
+        import sqlite3
+
+        self._poll_cache_db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(self._poll_cache_db_path)) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS polls("
+                "poll_event_id TEXT PRIMARY KEY, "
+                "room_id TEXT NOT NULL, "
+                "sender TEXT, "
+                "question TEXT, "
+                "options_json TEXT, "
+                "kind TEXT, "
+                "max_selections INTEGER, "
+                "started_at INTEGER, "
+                "ended_at INTEGER)"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS poll_responses("
+                "poll_event_id TEXT NOT NULL, "
+                "voter_user_id TEXT NOT NULL, "
+                "selections_json TEXT NOT NULL, "
+                "vote_event_id TEXT NOT NULL, "
+                "ts INTEGER NOT NULL, "
+                "PRIMARY KEY (poll_event_id, voter_user_id))"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS poll_responses_poll_idx "
+                "ON poll_responses(poll_event_id)"
+            )
+
+    def _poll_db_write(self, sql: str, params: tuple) -> None:
+        """Blocking SQLite write — call via asyncio.to_thread."""
+        import sqlite3
+
+        with sqlite3.connect(str(self._poll_cache_db_path)) as db:
+            db.execute(sql, params)
+
+    def _write_sent_poll_to_cache(
+        self,
+        event_id: str,
+        room_id: str,
+        question: str,
+        answer_payload: List[Dict[str, Any]],
+        kind: str,
+        max_selections: int,
+    ) -> None:
+        """Record a poll at send-time, independent of inbound decrypt.
+
+        Called from send_poll() on both the main gateway adapter and any
+        short-lived polls-device adapter. Writes to the shared
+        _POLL_CACHE_DB_PATH so the main gateway's tool reads see it.
+
+        answer_payload carries the real MSC1767 answer objects with the
+        UUIDs that went out in the poll event — voters' response events
+        reference those same IDs, so reading them back lets the tool
+        match votes to option labels.
+        """
+        import sqlite3
+        import time
+
+        _POLL_CACHE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Schema must match _init_poll_cache_db since this may run
+        # before the main gateway has had a chance to init.
+        with sqlite3.connect(str(_POLL_CACHE_DB_PATH)) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS polls("
+                "poll_event_id TEXT PRIMARY KEY, "
+                "room_id TEXT NOT NULL, "
+                "sender TEXT, "
+                "question TEXT, "
+                "options_json TEXT, "
+                "kind TEXT, "
+                "max_selections INTEGER, "
+                "started_at INTEGER, "
+                "ended_at INTEGER)"
+            )
+            options_payload = [
+                {
+                    "id": a.get("id", ""),
+                    "text": a.get("org.matrix.msc1767.text") or a.get("body") or "",
+                }
+                for a in answer_payload
+            ]
+            db.execute(
+                "INSERT OR REPLACE INTO polls"
+                "(poll_event_id, room_id, sender, question, options_json, "
+                "kind, max_selections, started_at, ended_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    event_id,
+                    room_id,
+                    str(getattr(self._client, "mxid", "") or ""),
+                    question,
+                    json.dumps(options_payload),
+                    kind,
+                    max_selections,
+                    int(time.time() * 1000),
+                ),
+            )
+
+    @staticmethod
+    def _poll_extract_text(node: Any) -> str:
+        """Pull the plaintext from a poll question/answer node. MSC1767
+        fallback: prefer org.matrix.msc1767.text, fall back to body."""
+        if not isinstance(node, dict):
+            return ""
+        return (
+            node.get("org.matrix.msc1767.text")
+            or node.get("body")
+            or ""
+        )
+
+    async def _on_poll_start(self, event: Any) -> None:
+        if not self._poll_cache_enabled:
+            return
+        try:
+            content = getattr(event, "content", None)
+            # mautrix may pass content as an object; support both.
+            if hasattr(content, "serialize"):
+                content = content.serialize()
+            content = content or {}
+            poll_data = (
+                content.get("org.matrix.msc3381.poll.start")
+                or content.get("m.poll.start")
+                or {}
+            )
+            question = self._poll_extract_text(poll_data.get("question"))
+            answers = poll_data.get("answers", []) or []
+            options = [
+                {"id": a.get("id", ""), "text": self._poll_extract_text(a)}
+                for a in answers
+            ]
+            await asyncio.to_thread(
+                self._poll_db_write,
+                "INSERT OR REPLACE INTO polls"
+                "(poll_event_id, room_id, sender, question, options_json, kind, max_selections, started_at, ended_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    str(event.event_id),
+                    str(event.room_id),
+                    str(getattr(event, "sender", "")),
+                    question,
+                    json.dumps(options),
+                    str(poll_data.get("kind", "")),
+                    int(poll_data.get("max_selections", 1) or 1),
+                    int(getattr(event, "timestamp", 0) or 0),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Matrix: failed to cache poll start: %s", exc)
+
+    async def _on_poll_response(self, event: Any) -> None:
+        if not self._poll_cache_enabled:
+            return
+        try:
+            content = getattr(event, "content", None)
+            if hasattr(content, "serialize"):
+                content = content.serialize()
+            content = content or {}
+            relates = content.get("m.relates_to", {}) or {}
+            if relates.get("rel_type") != "m.reference":
+                return
+            poll_event_id = relates.get("event_id")
+            if not poll_event_id:
+                return
+            response_data = (
+                content.get("org.matrix.msc3381.poll.response")
+                or content.get("m.poll.response")
+                or {}
+            )
+            # Empty answers list = vote retraction (still upsert so the
+            # most recent state wins).
+            selections = response_data.get("answers", []) or []
+            await asyncio.to_thread(
+                self._poll_db_write,
+                "INSERT OR REPLACE INTO poll_responses"
+                "(poll_event_id, voter_user_id, selections_json, vote_event_id, ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(poll_event_id),
+                    str(getattr(event, "sender", "")),
+                    json.dumps(selections),
+                    str(event.event_id),
+                    int(getattr(event, "timestamp", 0) or 0),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Matrix: failed to cache poll response: %s", exc)
+
+    async def _on_poll_end(self, event: Any) -> None:
+        if not self._poll_cache_enabled:
+            return
+        try:
+            content = getattr(event, "content", None)
+            if hasattr(content, "serialize"):
+                content = content.serialize()
+            content = content or {}
+            relates = content.get("m.relates_to", {}) or {}
+            if relates.get("rel_type") != "m.reference":
+                return
+            poll_event_id = relates.get("event_id")
+            if not poll_event_id:
+                return
+            await asyncio.to_thread(
+                self._poll_db_write,
+                "UPDATE polls SET ended_at = ? WHERE poll_event_id = ?",
+                (int(getattr(event, "timestamp", 0) or 0), str(poll_event_id)),
+            )
+        except Exception as exc:
+            logger.warning("Matrix: failed to cache poll end: %s", exc)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return room name and type (dm/group)."""
