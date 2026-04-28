@@ -57,6 +57,25 @@ class TestExtractMediaImages:
         assert "/audio.ogg" in paths
         assert "/screenshot.png" in paths
 
+    def test_inline_code_media_example_not_extracted(self):
+        content = "Use `MEDIA:/absolute/path/to/file.png` when sending a real attachment."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:/absolute/path/to/file.png" in cleaned
+
+    def test_fenced_code_media_example_not_extracted(self):
+        content = "Example:\n```text\nMEDIA:/absolute/path/to/file.png\n```"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:/absolute/path/to/file.png" in cleaned
+
+    def test_real_media_outside_code_still_extracted(self):
+        content = "Example `MEDIA:/example.png`\n\nActual:\nMEDIA:/tmp/real.png"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/tmp/real.png", False)]
+        assert "MEDIA:/example.png" in cleaned
+        assert "MEDIA:/tmp/real.png" not in cleaned
+
 
 # ---------------------------------------------------------------------------
 # Telegram send_image_file tests

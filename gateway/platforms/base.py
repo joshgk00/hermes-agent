@@ -2374,6 +2374,33 @@ class BasePlatformAdapter(ABC):
         return safe_paths
 
     @staticmethod
+    def _markdown_code_spans(content: str) -> list:
+        """Return character spans covered by fenced or inline Markdown code."""
+        spans = []
+        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            spans.append((m.start(), m.end()))
+        for m in re.finditer(r'`[^`\n]+`', content):
+            spans.append((m.start(), m.end()))
+        return spans
+
+    @staticmethod
+    def _span_inside(spans: list, start: int, end: int) -> bool:
+        return any(start >= span_start and end <= span_end for span_start, span_end in spans)
+
+    @staticmethod
+    def _remove_matches_outside_spans(content: str, pattern: re.Pattern, spans: list) -> str:
+        """Remove regex matches that are not inside protected spans."""
+        pieces = []
+        last = 0
+        for match in pattern.finditer(content):
+            if BasePlatformAdapter._span_inside(spans, match.start(), match.end()):
+                continue
+            pieces.append(content[last:match.start()])
+            last = match.end()
+        pieces.append(content[last:])
+        return ''.join(pieces)
+
+    @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
         """
         Extract MEDIA:<path> tags and [[audio_as_voice]] directives from response text.
@@ -2410,12 +2437,19 @@ class BasePlatformAdapter(ABC):
         # keep it out of the user-visible cleaned text.
         cleaned = cleaned.replace("[[as_document]]", "")
         
+        # Do not treat documentation/examples as attachment directives.
+        # This prevents explanatory text like ``MEDIA:/absolute/path/to/file.png``
+        # from being routed to platform upload handlers.
+        code_spans = BasePlatformAdapter._markdown_code_spans(content)
+
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
             r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
         )
         for match in media_pattern.finditer(content):
+            if BasePlatformAdapter._span_inside(code_spans, match.start(), match.end()):
+                continue
             path = match.group("path").strip()
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
@@ -2425,7 +2459,7 @@ class BasePlatformAdapter(ABC):
 
         # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
         if media:
-            cleaned = media_pattern.sub('', cleaned)
+            cleaned = BasePlatformAdapter._remove_matches_outside_spans(cleaned, media_pattern, code_spans)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
         return media, cleaned
@@ -3588,7 +3622,12 @@ class BasePlatformAdapter(ABC):
                 # Strip any remaining internal directives from message body (fixes #1561)
                 text_content = text_content.replace("[[audio_as_voice]]", "").strip()
                 text_content = text_content.replace("[[as_document]]", "").strip()
-                text_content = re.sub(r"MEDIA:\s*\S+", "", text_content).strip()
+                # Strip any leftover MEDIA directives without mutilating documentation/examples.
+                text_content = self._remove_matches_outside_spans(
+                    text_content,
+                    re.compile(r"MEDIA:\s*\S+"),
+                    self._markdown_code_spans(text_content),
+                ).strip()
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
