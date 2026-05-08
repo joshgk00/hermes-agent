@@ -500,6 +500,55 @@ class TestBlockingApprovalE2E:
         assert "timed out" in result_holder[0]["message"]
         unregister_gateway_notify(session_key)
 
+    def test_blocking_approval_zero_timeout_waits_until_resolved(self):
+        """approvals.gateway_timeout=0 disables the approval timeout."""
+        from tools.approval import (
+            register_gateway_notify, unregister_gateway_notify,
+            resolve_gateway_approval, check_all_command_guards,
+        )
+
+        session_key = "e2e-no-timeout"
+        notified = []
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+
+        result_holder = [None]
+
+        def agent_thread():
+            from tools.approval import reset_current_session_key, set_current_session_key
+
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                with patch("tools.approval._get_approval_config",
+                           return_value={"gateway_timeout": 0}):
+                    result_holder[0] = check_all_command_guards(
+                        "rm -rf /important", "local"
+                    )
+            finally:
+                os.environ.pop("HERMES_GATEWAY_SESSION", None)
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+
+        t = threading.Thread(target=agent_thread)
+        t.start()
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.05)
+        assert notified
+
+        time.sleep(1.2)
+        assert t.is_alive(), "approval should still be waiting with gateway_timeout=0"
+
+        resolve_gateway_approval(session_key, "once")
+        t.join(timeout=5)
+
+        assert result_holder[0]["approved"] is True
+        unregister_gateway_notify(session_key)
+
     def test_parallel_subagent_approvals(self):
         """Multiple threads can block concurrently and be resolved independently."""
         from tools.approval import (
