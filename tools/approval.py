@@ -1244,6 +1244,7 @@ def check_all_command_guards(command: str, env_type: str,
                 }
 
             # Block until the user responds or timeout (default 5 min).
+            # Set approvals.gateway_timeout <= 0 to wait indefinitely.
             # Poll in short slices so we can fire activity heartbeats every
             # ~10s to the agent's inactivity tracker.  Without this, the
             # blocking event.wait() never touches activity, and the
@@ -1263,17 +1264,21 @@ def check_all_command_guards(command: str, env_type: str,
                 touch_activity_if_due = None
 
             _now = time.monotonic()
-            _deadline = _now + max(timeout, 0)
+            _deadline = None if timeout <= 0 else _now + timeout
             _activity_state = {"last_touch": _now, "start": _now}
             resolved = False
             while True:
-                _remaining = _deadline - time.monotonic()
-                if _remaining <= 0:
-                    break
+                if _deadline is None:
+                    _remaining = None
+                else:
+                    _remaining = _deadline - time.monotonic()
+                    if _remaining <= 0:
+                        break
                 # 1s poll slice — the event is set immediately when the
                 # user responds, so slice length only controls heartbeat
                 # cadence, not user-visible responsiveness.
-                if entry.event.wait(timeout=min(1.0, _remaining)):
+                wait_seconds = 1.0 if _remaining is None else min(1.0, _remaining)
+                if entry.event.wait(timeout=wait_seconds):
                     resolved = True
                     break
                 if touch_activity_if_due is not None:

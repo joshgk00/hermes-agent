@@ -1112,6 +1112,10 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
                 if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
                     os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
+                if "decision_reactions" in matrix_cfg and not os.getenv("MATRIX_DECISION_REACTIONS"):
+                    os.environ["MATRIX_DECISION_REACTIONS"] = str(matrix_cfg["decision_reactions"]).lower()
+                if "decision_reaction_expiry_days" in matrix_cfg and not os.getenv("MATRIX_DECISION_REACTION_EXPIRY_DAYS"):
+                    os.environ["MATRIX_DECISION_REACTION_EXPIRY_DAYS"] = str(matrix_cfg["decision_reaction_expiry_days"])
 
             # Feishu settings → env vars (env vars take precedence)
             feishu_cfg = yaml_cfg.get("feishu", {})
