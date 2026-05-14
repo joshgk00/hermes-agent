@@ -19,3 +19,8 @@
 - prompt-optimization-analyzer (~1,250 tokens): Framework tables still take more space than the fixes they describe. Collapse severity/waste/anti-pattern tables into one checklist and keep one realistic before/after example. Saves ~180-260 tokens; clarity unchanged.
 - decision-moment-cards (~1,900 tokens): Main skill now includes implementation design, troubleshooting, direct Matrix send fallback, and registration internals. Move those to `references/direct-matrix-card-registration.md` and keep the main skill to card schema, cron precedence, reactions, and fallbacks. Saves ~650-900 tokens; lowers duplicate-delivery risk.
 - nightly-maintenance-routine (~1,100 tokens): Quiet delivery, memory failure handling, and git push fallback repeat across Workflow/Pitfalls/Delivery. Merge into one delivery rule and one git fallback rule. Saves ~90-140 tokens.
+
+## 2026-05-14 Nightly Maintenance
+- prompt-optimization-analyzer (~1,300 tokens): Still uses four diagnostic tables plus an example that repeats the output schema. Merge severity/waste/anti-pattern checks into one compact checklist and keep one before/after example. Saves ~200-300 tokens; trigger reliability unchanged.
+- decision-moment-cards (~1,950 tokens): Troubleshooting, gateway registry design, and direct-send fallback dominate routine card creation. Move those details to references and keep the main skill to card fields, cron precedence, reactions, and fallback commands. Saves ~700-950 tokens; lowers duplicate-delivery risk.
+- nightly-maintenance-routine (~1,150 tokens): Git fallback, quiet delivery, and memory failure handling repeat across Workflow/Pitfalls/Verification. Keep single rules in Workflow and shorten Pitfalls to exceptions only. Saves ~100-150 tokens.
