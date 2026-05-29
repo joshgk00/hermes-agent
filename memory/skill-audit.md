@@ -5,3 +5,9 @@
 - `prompt-optimization-analyzer`: Strong output schema, but trigger scope says “Claude Code skill optimization” while this environment audits Hermes skills too. Suggested rewrite: “Analyze Hermes/Claude Code skill prompts for trigger reliability, token waste, anti-patterns, and publication readiness.” Impact: better trigger accuracy, negligible token change.
 - `decision-moment-cards`: Useful but long. Cron delivery rules repeat send/no-send precedence across several bullets. Suggested optimization: merge cron delivery precedence into one ordered rule block. Estimated savings: ~120-180 tokens, clarity moderate.
 - `nightly-maintenance-routine`: Good fit for this job. Workflow and git push rules are specific. No critical changes; possible savings ~60 tokens by merging repeated “do not manually deliver” lines.
+
+## 2026-05-29 nightly maintenance
+
+- `prompt-optimization-analyzer`: Still open: description names Claude Code only, but this run audits Hermes skills too. Rewrite description to “Analyze Hermes/Claude Code skill prompts for trigger reliability, token waste, anti-patterns, and publication readiness.” Impact: trigger accuracy better, token change negligible.
+- `decision-moment-cards`: Still open: cron delivery precedence repeats across bullets. Merge into one ordered precedence block. Estimated savings: ~120-180 tokens, clarity moderate.
+- `nightly-maintenance-routine`: Still open: delivery guidance repeats auto-delivery/no-send handling. Merge workflow step 6 with the cron-specific exception. Estimated savings: ~60 tokens.

@@ -28,6 +28,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -130,6 +131,8 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+_STATE_STORE_PATH = _STORE_DIR / "state.pickle"
+_SYNC_STORE_PATH = _STORE_DIR / "sync.json"
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -350,6 +353,41 @@ class _CryptoStateStore:
     async def find_shared_rooms(self, user_id: str) -> list:
         # Return all joined rooms — simple but correct for a single-user bot.
         return list(self._joined_rooms)
+
+
+class _JsonSyncStore:
+    """Tiny persistent SyncStore for mautrix /sync next_batch tokens."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._next_batch: Optional[str] = None
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self._path.exists():
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                token = data.get("next_batch")
+                self._next_batch = str(token) if token else None
+        except Exception as exc:
+            logger.warning("Matrix: could not load sync store %s: %s", self._path, exc)
+            self._next_batch = None
+
+    async def put_next_batch(self, next_batch: Any) -> None:
+        self._next_batch = str(next_batch) if next_batch else None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._path.with_suffix(".json.tmp")
+            tmp_path.write_text(
+                json.dumps({"next_batch": self._next_batch}),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self._path)
+        except Exception as exc:
+            logger.warning("Matrix: could not persist sync token to %s: %s", self._path, exc)
+
+    async def get_next_batch(self) -> Any:
+        return self._next_batch
 
 
 class MatrixAdapter(BasePlatformAdapter):
@@ -658,7 +696,7 @@ class MatrixAdapter(BasePlatformAdapter):
         """Connect to the Matrix homeserver and start syncing."""
         from mautrix.api import HTTPAPI
         from mautrix.client import Client
-        from mautrix.client.state_store import MemoryStateStore, MemorySyncStore
+        from mautrix.client.state_store import FileStateStore
 
         if not self._homeserver:
             logger.error("Matrix: homeserver URL not configured")
@@ -676,8 +714,10 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         # Create the client.
-        state_store = MemoryStateStore()
-        sync_store = MemorySyncStore()
+        state_store = FileStateStore(_STATE_STORE_PATH, save_interval=5.0)
+        if hasattr(state_store, "open"):
+            await state_store.open()
+        sync_store: Any = _JsonSyncStore(_SYNC_STORE_PATH)
         client = Client(
             mxid=UserID(self._user_id) if self._user_id else UserID(""),
             device_id=self._device_id or None,
@@ -687,6 +727,8 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         self._client = client
+        self._state_store = state_store
+        self._sync_store = sync_store
 
         # Authenticate.
         if self._access_token:
@@ -1004,6 +1046,17 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self._crypto_db.stop()
             except Exception as exc:
                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+
+        # Flush the Matrix state store before closing the HTTP client.
+        state_store = getattr(self, "_state_store", None)
+        if state_store:
+            try:
+                if hasattr(state_store, "flush"):
+                    await state_store.flush()
+                if hasattr(state_store, "close"):
+                    await state_store.close()
+            except Exception as exc:
+                logger.debug("Matrix: could not close state store on disconnect: %s", exc)
 
         if self._client:
             try:
