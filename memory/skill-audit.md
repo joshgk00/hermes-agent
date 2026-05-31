@@ -17,3 +17,9 @@
 - `prompt-optimization-analyzer`: Still open: description scopes the role to Claude Code while active use covers Hermes skills. Rewrite description to “Analyze Hermes/Claude Code skill prompts for trigger reliability, token waste, anti-patterns, and publication readiness.” Impact: trigger reliability better, token change negligible.
 - `decision-moment-cards`: Still open: cron-specific delivery rules repeat auto-delivery precedence and Matrix send fallback details. Merge into one precedence block plus one fallback block. Estimated savings: ~150-220 tokens, clarity moderate.
 - `nightly-maintenance-routine`: Still open: delivery behavior repeats scheduler/no-send precedence. Merge step 6 with pitfalls into one quiet-delivery rule. Estimated savings: ~60 tokens.
+
+## 2026-05-31 nightly maintenance
+
+- `prompt-optimization-analyzer`: Still open: trigger scope says Claude Code, but this run audits Hermes skills. Rewrite description to “Analyze Hermes/Claude Code skill prompts for trigger reliability, token waste, anti-patterns, and publication readiness.” Impact: trigger reliability better, token change negligible.
+- `decision-moment-cards`: Still open: cron guidance repeats auto-delivery precedence and manual Matrix fallback. Merge into one precedence block plus one fallback block. Estimated savings: ~150-220 tokens, clarity moderate.
+- `nightly-maintenance-routine`: Still open: quiet-delivery/no-send precedence appears in workflow and delivery notes. Merge into one quiet-delivery rule. Estimated savings: ~60 tokens.
