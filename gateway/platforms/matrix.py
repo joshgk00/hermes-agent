@@ -28,6 +28,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -40,6 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 try:
+    from mautrix.client.state_store import SyncStore
     from mautrix.types import (
         ContentURI,
         EventID,
@@ -57,6 +59,7 @@ except ImportError:
     # check_matrix_requirements() will return False and the adapter
     # won't be instantiated in production, but tests may exercise
     # adapter methods so stubs must have the right attributes.
+    SyncStore = object  # type: ignore[assignment]
     ContentURI = EventID = RoomID = SyncToken = UserID = str  # type: ignore[misc,assignment]
 
     class _EventTypeStub:  # type: ignore[no-redef]
@@ -130,6 +133,8 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+_STATE_STORE_PATH = _STORE_DIR / "state.pickle"
+_SYNC_STORE_PATH = _STORE_DIR / "sync.json"
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -145,6 +150,32 @@ _E2EE_INSTALL_HINT = (
     "Install with: pip install 'mautrix[encryption]' asyncpg aiosqlite  "
     "(requires libolm C library)"
 )
+
+
+class _JsonSyncStore(SyncStore):  # type: ignore[misc,valid-type]
+    """Tiny persistent Matrix sync token store."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.next_batch = None
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+            token = data.get("next_batch") if isinstance(data, dict) else None
+            self.next_batch = SyncToken(token) if token else None
+        except Exception as exc:
+            logger.warning("Matrix: could not load sync store %s: %s", path, exc)
+
+    async def get_next_batch(self):
+        return self.next_batch
+
+    async def put_next_batch(self, next_batch):
+        self.next_batch = next_batch
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps({"next_batch": str(next_batch)}))
+        except Exception as exc:
+            logger.warning("Matrix: could not persist sync token to %s: %s", self.path, exc)
+
 
 _MATRIX_IMAGE_FILENAME_EXTS = frozenset({
     ".jpg",
@@ -658,7 +689,7 @@ class MatrixAdapter(BasePlatformAdapter):
         """Connect to the Matrix homeserver and start syncing."""
         from mautrix.api import HTTPAPI
         from mautrix.client import Client
-        from mautrix.client.state_store import MemoryStateStore, MemorySyncStore
+        from mautrix.client.state_store import FileStateStore
 
         if not self._homeserver:
             logger.error("Matrix: homeserver URL not configured")
@@ -676,8 +707,11 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         # Create the client.
-        state_store = MemoryStateStore()
-        sync_store = MemorySyncStore()
+        state_store = FileStateStore(_STATE_STORE_PATH, save_interval=5.0)
+        if hasattr(state_store, "open"):
+            await state_store.open()
+        self._state_store = state_store
+        sync_store = _JsonSyncStore(_SYNC_STORE_PATH)
         client = Client(
             mxid=UserID(self._user_id) if self._user_id else UserID(""),
             device_id=self._device_id or None,
@@ -1004,6 +1038,14 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self._crypto_db.stop()
             except Exception as exc:
                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+
+        # Close the persistent Matrix state store.
+        if hasattr(self, "_state_store") and self._state_store:
+            try:
+                await self._state_store.flush()
+                await self._state_store.close()
+            except Exception as exc:
+                logger.debug("Matrix: could not close state store on disconnect: %s", exc)
 
         if self._client:
             try:
