@@ -29,3 +29,8 @@
 - decision-moment-cards: Still open. Direct Matrix send/registration fallback details still dominate SKILL.md. Move implementation steps to `references/direct-matrix-card-registration.md` and keep only card schema, reaction semantics, escalation, and auto-delivery precedence. Estimated savings: ~900-1,200 tokens; trigger reliability same.
 - nightly-maintenance-routine: Still open. Delivery and git push caveats repeat other skills. Keep the run sequence, security classification rules, and one auto-delivery precedence rule. Estimated savings: ~250-350 tokens; clarity moderate.
 - prompt-optimization-analyzer: Still open. Output Format, Constraints, and examples repeat “specific/actionable/line numbers/estimates.” Collapse into one rubric and keep two examples. Estimated savings: ~150-250 tokens; clarity minor.
+
+## 2026-06-12
+- decision-moment-cards: Still open. Cron Matrix rollout and manual send/register fallback remain too long for a skill body. Move implementation caveats to `references/direct-matrix-card-registration.md`; keep card schema, reaction semantics, and auto-delivery precedence. Estimated savings: ~900-1,200 tokens; trigger reliability same.
+- nightly-maintenance-routine: Still open. Delivery and push fallback details repeat decision-card and git workflow guidance. Keep the maintenance sequence, security classification rules, and one auto-delivery precedence note. Estimated savings: ~250-350 tokens; clarity moderate.
+- prompt-optimization-analyzer: Still open. Output Format, Constraints, and examples repeat the same “specific/actionable/line numbers/estimates” rules. Collapse into one rubric and keep two examples. Estimated savings: ~150-250 tokens; clarity minor.
