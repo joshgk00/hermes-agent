@@ -3437,8 +3437,8 @@ _PLATFORMS = [
              "help": "Your Mattermost user ID from step 4 above."},
             {"name": "MATTERMOST_HOME_CHANNEL", "prompt": "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)", "password": False,
              "help": "Channel ID where Hermes delivers cron results and notifications."},
-            {"name": "MATTERMOST_REPLY_MODE", "prompt": "Reply mode — 'off' for flat messages, 'thread' for threaded replies (default: off)", "password": False,
-             "help": "off = flat channel messages, thread = replies nest under your message."},
+            {"name": "MATTERMOST_REPLY_MODE", "prompt": "Reply mode — 'off', 'follow_thread', or 'thread' (default: off)", "password": False,
+             "help": "off = always flat, follow_thread = flat unless the user is already in a Mattermost thread, thread = always nest under your message."},
         ],
     },
     {

@@ -238,6 +238,55 @@ class TestMattermostSend:
         assert "root_id" not in payload
 
     @pytest.mark.asyncio
+    async def test_send_follow_thread_top_level_no_root_id(self):
+        """follow_thread should not create a thread for top-level messages."""
+        self.adapter._reply_mode = "follow_thread"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"id": "post_top_level"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+        self.adapter._session.get = MagicMock()
+
+        result = await self.adapter.send("channel_1", "Reply!", reply_to="top_post")
+
+        assert result.success is True
+        payload = self.adapter._session.post.call_args[1]["json"]
+        assert "root_id" not in payload
+        self.adapter._session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_follow_thread_uses_metadata_thread_id(self):
+        """follow_thread should stay inside existing Mattermost threads."""
+        self.adapter._reply_mode = "follow_thread"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"id": "post_in_thread"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+        self.adapter._session.get = MagicMock()
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Reply!",
+            reply_to="reply_post",
+            metadata={"thread_id": "root_post"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._session.post.call_args[1]["json"]
+        assert payload["root_id"] == "root_post"
+        self.adapter._session.get.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_send_api_failure(self):
         """When API returns error, send should return failure."""
         mock_resp = AsyncMock()

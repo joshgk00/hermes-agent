@@ -90,7 +90,11 @@ class MattermostAdapter(BasePlatformAdapter):
         self._reconnect_task: Optional[asyncio.Task] = None
         self._closing = False
 
-        # Reply mode: "thread" to nest replies, "off" for flat messages.
+        # Reply mode:
+        # - "off": always post flat channel messages.
+        # - "thread": always set root_id when a reply anchor exists.
+        # - "follow_thread": set root_id only when the incoming Mattermost post was already threaded.
+        # - "smart": legacy alias for "follow_thread".
         self._reply_mode: str = (
             config.extra.get("reply_mode", "")
             or os.getenv("MATTERMOST_REPLY_MODE", "off")
@@ -266,6 +270,21 @@ class MattermostAdapter(BasePlatformAdapter):
             return data["root_id"]
         return post_id
 
+    async def _root_id_for_reply(
+        self,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Return the Mattermost root_id to use for the current reply mode."""
+        if self._reply_mode == "off":
+            return None
+        if self._reply_mode in {"follow_thread", "smart"}:
+            thread_id = (metadata or {}).get("thread_id")
+            return str(thread_id) if thread_id else None
+        if self._reply_mode == "thread" and reply_to:
+            return await self._resolve_root_id(reply_to)
+        return None
+
     async def send(
         self,
         chat_id: str,
@@ -286,12 +305,9 @@ class MattermostAdapter(BasePlatformAdapter):
                 "channel_id": chat_id,
                 "message": chunk,
             }
-            # Thread support: reply_to is the root post ID.
-            if reply_to and self._reply_mode == "thread":
-                # Ensure root_id points to the thread root, not a reply.
-                # Mattermost rejects non-root post IDs as root_id.
-                resolved_root = await self._resolve_root_id(reply_to)
-                payload["root_id"] = resolved_root
+            root_id = await self._root_id_for_reply(reply_to, metadata)
+            if root_id:
+                payload["root_id"] = root_id
 
             data = await self._api_post("posts", payload)
             if not data or "id" not in data:
@@ -346,7 +362,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Download an image and upload it as a file attachment."""
         return await self._send_url_as_file(
-            chat_id, image_url, caption, reply_to, "image"
+            chat_id, image_url, caption, reply_to, "image", metadata
         )
 
     async def send_image_file(
@@ -359,7 +375,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload a local image file."""
         return await self._send_local_file(
-            chat_id, image_path, caption, reply_to
+            chat_id, image_path, caption, reply_to, metadata=metadata
         )
 
     async def send_document(
@@ -373,7 +389,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload a local file as a document."""
         return await self._send_local_file(
-            chat_id, file_path, caption, reply_to, file_name
+            chat_id, file_path, caption, reply_to, file_name, metadata
         )
 
     async def send_voice(
@@ -386,7 +402,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload an audio file."""
         return await self._send_local_file(
-            chat_id, audio_path, caption, reply_to
+            chat_id, audio_path, caption, reply_to, metadata=metadata
         )
 
     async def send_video(
@@ -399,7 +415,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload a video file."""
         return await self._send_local_file(
-            chat_id, video_path, caption, reply_to
+            chat_id, video_path, caption, reply_to, metadata=metadata
         )
 
     def format_message(self, content: str) -> str:
@@ -423,12 +439,13 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str],
         reply_to: Optional[str],
         kind: str = "file",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Download a URL and upload it as a file attachment."""
         from tools.url_safety import is_safe_url
         if not is_safe_url(url):
             logger.warning("Mattermost: blocked unsafe URL (SSRF protection)")
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         import aiohttp
 
@@ -446,7 +463,7 @@ class MattermostAdapter(BasePlatformAdapter):
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
                     if resp.status >= 400:
-                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
                     file_data = await resp.read()
                     ct = resp.content_type or "application/octet-stream"
                     break
@@ -455,23 +472,24 @@ class MattermostAdapter(BasePlatformAdapter):
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 logger.warning("Mattermost: failed to download %s after %d attempts: %s", url, attempt + 1, exc)
-                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         if file_data is None:
             logger.warning("Mattermost: download returned no data for %s", url)
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         file_id = await self._upload_file(chat_id, file_data, fname, ct)
         if not file_id:
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         payload: Dict[str, Any] = {
             "channel_id": chat_id,
             "message": caption or "",
             "file_ids": [file_id],
         }
-        if reply_to and self._reply_mode == "thread":
-            payload["root_id"] = await self._resolve_root_id(reply_to)
+        root_id = await self._root_id_for_reply(reply_to, metadata)
+        if root_id:
+            payload["root_id"] = root_id
 
         data = await self._api_post("posts", payload)
         if not data or "id" not in data:
@@ -485,6 +503,7 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str],
         reply_to: Optional[str],
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Upload a local file and attach it to a post."""
         import mimetypes
@@ -509,8 +528,9 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         }
-        if reply_to and self._reply_mode == "thread":
-            payload["root_id"] = await self._resolve_root_id(reply_to)
+        root_id = await self._root_id_for_reply(reply_to, metadata)
+        if root_id:
+            payload["root_id"] = root_id
 
         data = await self._api_post("posts", payload)
         if not data or "id" not in data:
@@ -596,6 +616,9 @@ class MattermostAdapter(BasePlatformAdapter):
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 }
+                root_id = await self._root_id_for_reply(None, metadata)
+                if root_id:
+                    payload["root_id"] = root_id
                 logger.info(
                     "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                     len(file_ids), chunk_idx + 1, len(chunks),
