@@ -103,6 +103,11 @@ class MattermostAdapter(BasePlatformAdapter):
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
 
+        # Approval prompts keyed by the Mattermost post ID. Reaction events do
+        # not pass through the normal message authorization flow, so the
+        # reaction handler validates MATTERMOST_ALLOWED_USERS before resolving.
+        self._approval_reaction_state: Dict[str, Dict[str, str]] = {}
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
@@ -351,6 +356,49 @@ class MattermostAdapter(BasePlatformAdapter):
         if not data or "id" not in data:
             return SendResult(success=False, error="Failed to edit post")
         return SendResult(success=True, message_id=data["id"])
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Mattermost approval prompt that resolves through reactions."""
+        cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
+        message = (
+            "⚠️ **Command approval required**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {description}\n\n"
+            "React with ✅ to allow once, 🟦 to allow for this session, "
+            "♾️ to always allow, or ❌ to deny."
+        )
+        result = await self.send(chat_id, message, metadata=metadata)
+        if not result.success or not result.message_id:
+            return result
+
+        self._approval_reaction_state[str(result.message_id)] = {
+            "session_key": session_key,
+            "chat_id": chat_id,
+        }
+
+        # Seed the post with the available choices. If the bot lacks reaction
+        # permission, the text instructions still let desktop clients approve.
+        for emoji_name in ("white_check_mark", "blue_square", "infinity", "x"):
+            try:
+                await self._api_post(
+                    "reactions",
+                    {
+                        "user_id": self._bot_user_id,
+                        "post_id": str(result.message_id),
+                        "emoji_name": emoji_name,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Mattermost: failed to seed approval reaction %s: %s", emoji_name, exc)
+
+        return result
 
     async def send_image(
         self,
@@ -711,9 +759,91 @@ class MattermostAdapter(BasePlatformAdapter):
                 logger.info("Mattermost: WebSocket closed (%s)", raw_msg.type)
                 break
 
+    async def _handle_reaction_added(self, event: Dict[str, Any]) -> None:
+        """Resolve approval prompts from Mattermost reaction events."""
+        data = event.get("data", {}) or {}
+        raw_reaction = data.get("reaction")
+        if not raw_reaction:
+            return
+        try:
+            reaction = json.loads(raw_reaction) if isinstance(raw_reaction, str) else raw_reaction
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(reaction, dict):
+            return
+
+        post_id = str(reaction.get("post_id") or "")
+        state = self._approval_reaction_state.get(post_id)
+        if not state:
+            return
+
+        user_id = str(reaction.get("user_id") or "")
+        if not user_id or user_id == self._bot_user_id:
+            return
+
+        allowed_csv = os.getenv("MATTERMOST_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "Mattermost: unauthorized approval reaction by %s on %s — ignoring",
+                    user_id,
+                    post_id,
+                )
+                return
+
+        emoji_name = str(reaction.get("emoji_name") or "").strip().lower()
+        choice_map = {
+            "white_check_mark": "once",
+            "heavy_check_mark": "once",
+            "check": "once",
+            "blue_square": "session",
+            "large_blue_square": "session",
+            "infinity": "always",
+            "x": "deny",
+            "negative_squared_cross_mark": "deny",
+            "no_entry_sign": "deny",
+        }
+        choice = choice_map.get(emoji_name)
+        if not choice:
+            return
+
+        state = self._approval_reaction_state.pop(post_id, None)
+        if not state:
+            return
+
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(state["session_key"], choice)
+            logger.info(
+                "Mattermost reaction resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                count,
+                state["session_key"],
+                choice,
+                user_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Mattermost: failed to resolve approval reaction: %s", exc, exc_info=True)
+            return
+
+        label_map = {
+            "once": f"✅ Approved once by {user_id}",
+            "session": f"✅ Approved for session by {user_id}",
+            "always": f"✅ Approved permanently by {user_id}",
+            "deny": f"❌ Denied by {user_id}",
+        }
+        await self.send(
+            state["chat_id"],
+            label_map.get(choice, f"Resolved by {user_id}"),
+            metadata={"thread_id": post_id},
+        )
+
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         """Process a single WebSocket event."""
         event_type = event.get("event")
+        if event_type == "reaction_added":
+            await self._handle_reaction_added(event)
+            return
         if event_type != "posted":
             return
 

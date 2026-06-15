@@ -302,6 +302,39 @@ class TestMattermostSend:
 
         assert result.success is False
 
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_posts_reaction_prompt(self):
+        """Approval prompts should post instructions and seed reaction choices."""
+        calls = []
+
+        async def fake_api_post(path, payload):
+            calls.append((path, payload))
+            if path == "posts":
+                return {"id": "approval_post"}
+            return {"ok": True}
+
+        self.adapter._bot_user_id = "bot_user"
+        self.adapter._api_post = fake_api_post
+
+        result = await self.adapter.send_exec_approval(
+            "channel_1",
+            "rm -rf /tmp/demo",
+            "session_1",
+            "dangerous command",
+        )
+
+        assert result.success is True
+        assert result.message_id == "approval_post"
+        assert self.adapter._approval_reaction_state["approval_post"]["session_key"] == "session_1"
+        assert calls[0][0] == "posts"
+        assert "React with" in calls[0][1]["message"]
+        assert [payload["emoji_name"] for path, payload in calls[1:] if path == "reactions"] == [
+            "white_check_mark",
+            "blue_square",
+            "infinity",
+            "x",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # WebSocket event parsing
@@ -370,6 +403,77 @@ class TestMattermostWebSocketParsing:
 
         await self.adapter._handle_ws_event(event)
         assert not self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_reaction_added_resolves_approval(self, monkeypatch):
+        """Reaction events on approval posts should unblock the gateway approval."""
+        resolved = []
+        sent = []
+
+        def fake_resolve(session_key, choice):
+            resolved.append((session_key, choice))
+            return 1
+
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            sent.append((chat_id, content, metadata))
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True, message_id="followup")
+
+        monkeypatch.setenv("MATTERMOST_ALLOWED_USERS", "user_123")
+        monkeypatch.setattr("tools.approval.resolve_gateway_approval", fake_resolve)
+        self.adapter.send = fake_send
+        self.adapter._approval_reaction_state["approval_post"] = {
+            "session_key": "session_1",
+            "chat_id": "channel_1",
+        }
+        event = {
+            "event": "reaction_added",
+            "data": {
+                "reaction": json.dumps({
+                    "post_id": "approval_post",
+                    "user_id": "user_123",
+                    "emoji_name": "white_check_mark",
+                })
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        assert resolved == [("session_1", "once")]
+        assert "approval_post" not in self.adapter._approval_reaction_state
+        assert sent[0][0] == "channel_1"
+        assert sent[0][2] == {"thread_id": "approval_post"}
+
+    @pytest.mark.asyncio
+    async def test_reaction_added_rejects_unauthorized_user(self, monkeypatch):
+        """Unauthorized approval reactions should not resolve or consume state."""
+        resolved = []
+
+        def fake_resolve(session_key, choice):
+            resolved.append((session_key, choice))
+            return 1
+
+        monkeypatch.setenv("MATTERMOST_ALLOWED_USERS", "allowed_user")
+        monkeypatch.setattr("tools.approval.resolve_gateway_approval", fake_resolve)
+        self.adapter._approval_reaction_state["approval_post"] = {
+            "session_key": "session_1",
+            "chat_id": "channel_1",
+        }
+        event = {
+            "event": "reaction_added",
+            "data": {
+                "reaction": json.dumps({
+                    "post_id": "approval_post",
+                    "user_id": "intruder",
+                    "emoji_name": "white_check_mark",
+                })
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        assert resolved == []
+        assert "approval_post" in self.adapter._approval_reaction_state
 
     @pytest.mark.asyncio
     async def test_ignore_system_posts(self):
