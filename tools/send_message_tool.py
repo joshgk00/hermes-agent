@@ -684,8 +684,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
-    # --- Matrix: use the native adapter helper when media is present ---
-    if platform == Platform.MATRIX and media_files:
+    # --- Matrix: use the native adapter helper when media is present or E2EE is enabled ---
+    # The direct Client-Server API path sends m.room.message plaintext. That is invalid
+    # for encrypted rooms and shows an "unencrypted" warning in Element. Route E2EE
+    # sends through MatrixAdapter so mautrix encrypts the event before upload.
+    matrix_e2ee_enabled = False
+    if platform == Platform.MATRIX:
+        matrix_e2ee_enabled = bool(
+            getattr(pconfig, "extra", {}).get("encryption")
+            or os.getenv("MATRIX_ENCRYPTION", "").lower() in {"true", "1", "yes"}
+        )
+    if platform == Platform.MATRIX and (media_files or matrix_e2ee_enabled):
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)

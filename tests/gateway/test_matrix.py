@@ -2,6 +2,7 @@
 import asyncio
 import sys
 import types
+from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -1559,6 +1560,41 @@ class TestMatrixUploadAndSend:
         assert sent["file"]["url"] == "mxc://example.org/enc"
 
 
+class TestMatrixDecisionCardReactions:
+    @pytest.mark.asyncio
+    async def test_send_decision_moment_adds_action_reactions(self):
+        adapter = _make_adapter()
+        fake_client = MagicMock()
+        fake_client.send_message_event = AsyncMock(
+            side_effect=["$card", "$approve-reaction", "$deny-reaction", "$close-reaction"]
+        )
+        adapter._client = fake_client
+
+        result = await adapter.send(
+            "!room:example.org",
+            "**Decision Moment:** Test\n\n✅ approve\n❌ deny",
+        )
+
+        assert result.success is True
+        assert result.message_id == "$card"
+        assert fake_client.send_message_event.await_count == 4
+        reaction_payloads = [call.args[2] for call in fake_client.send_message_event.await_args_list[1:]]
+        assert [p["m.relates_to"]["key"] for p in reaction_payloads] == ["✅", "❌", "🗑️"]
+        assert all(p["m.relates_to"]["event_id"] == "$card" for p in reaction_payloads)
+
+    @pytest.mark.asyncio
+    async def test_send_regular_message_does_not_add_action_reactions(self):
+        adapter = _make_adapter()
+        fake_client = MagicMock()
+        fake_client.send_message_event = AsyncMock(return_value="$event")
+        adapter._client = fake_client
+
+        result = await adapter.send("!room:example.org", "✅ done, ❌ failed")
+
+        assert result.success is True
+        assert fake_client.send_message_event.await_count == 1
+
+
 class TestMatrixEncryptedSendFallback:
     @pytest.mark.asyncio
     async def test_send_retries_after_e2ee_error(self):
@@ -2859,3 +2895,234 @@ class TestCreateMatrixSession:
                     assert session.connector is fake_connector
                 finally:
                     await session.close()
+
+class TestMatrixReplyToText:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._user_id = "@bot:example.org"
+        self.adapter._startup_ts = 0.0
+        self.adapter._dm_rooms = {}
+        self.adapter._text_batch_delay_seconds = 0
+        self.adapter._is_dm_room = AsyncMock(return_value=True)
+        self.adapter._get_display_name = AsyncMock(return_value="Josh")
+        self.adapter._background_read_receipt = lambda room_id, event_id: None
+        self.adapter.handle_message = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_matrix_reply_fetches_parent_text_for_context_injection(self):
+        parent = MagicMock()
+        parent.content = {
+            "msgtype": "m.text",
+            "body": "**Decision Moment Test 1**\n\nProposed change: Close stale sample workflow.",
+        }
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_event = AsyncMock(return_value=parent)
+
+        source_content = {
+            "msgtype": "m.text",
+            "body": "> <@bot:example.org> **Decision Moment Test 1**\n> Proposed change: Close stale sample workflow.\n\nChange this to archive instead.",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$decision-card"}},
+        }
+
+        await self.adapter._handle_text_message(
+            "!room:example.org",
+            "@josh:example.org",
+            "$reply",
+            0.0,
+            source_content,
+            source_content["m.relates_to"],
+        )
+
+        self.adapter._client.get_event.assert_awaited_once()
+        msg_event = self.adapter.handle_message.await_args.args[0]
+        assert msg_event.reply_to_message_id == "$decision-card"
+        assert "Decision Moment Test 1" in msg_event.reply_to_text
+        assert msg_event.text == "Change this to archive instead."
+
+    @pytest.mark.asyncio
+    async def test_matrix_reply_text_missing_if_fetch_fails(self):
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_event = AsyncMock(side_effect=RuntimeError("not found"))
+        source_content = {
+            "msgtype": "m.text",
+            "body": "Change this",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$missing"}},
+        }
+
+        await self.adapter._handle_text_message(
+            "!room:example.org",
+            "@josh:example.org",
+            "$reply",
+            0.0,
+            source_content,
+            source_content["m.relates_to"],
+        )
+
+        msg_event = self.adapter.handle_message.await_args.args[0]
+        assert msg_event.reply_to_message_id == "$missing"
+        assert msg_event.reply_to_text is None
+
+
+# ---------------------------------------------------------------------------
+# Matrix decision card reactions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_matrix_reaction_routes_registered_decision_card(tmp_path: Path):
+    from gateway.decision_cards import DecisionCardStore
+
+    adapter = _make_adapter()
+    adapter._decision_reactions_enabled = True
+    adapter._decision_card_store = DecisionCardStore(path=tmp_path / "cards.json")
+    adapter._allowed_user_ids = {"@josh:matrix.org"}
+    adapter._client = None
+    adapter.handle_message = AsyncMock()
+    adapter._decision_card_store.create(
+        platform="matrix",
+        room_id="!room:matrix.org",
+        message_id="$card",
+        body="Decision: D-1\nProposed action: update pending-decisions.md",
+        decision_id="D-1",
+    )
+
+    event = types.SimpleNamespace(
+        sender="@josh:matrix.org",
+        event_id="$reaction",
+        room_id="!room:matrix.org",
+        content={
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": "$card",
+                "key": "✅",
+            }
+        },
+    )
+
+    await adapter._on_reaction(event)
+
+    adapter.handle_message.assert_awaited_once()
+    msg = adapter.handle_message.await_args.args[0]
+    assert "Decision ID: D-1" in msg.text
+    assert "Action: approve" in msg.text
+    assert msg.source.platform == Platform.MATRIX
+    assert msg.source.chat_id == "!room:matrix.org"
+
+
+@pytest.mark.asyncio
+async def test_matrix_decision_reaction_ignores_unauthorized_user(tmp_path: Path):
+    from gateway.decision_cards import DecisionCardStore
+
+    adapter = _make_adapter()
+    adapter._decision_reactions_enabled = True
+    adapter._decision_card_store = DecisionCardStore(path=tmp_path / "cards.json")
+    adapter._allowed_user_ids = {"@josh:matrix.org"}
+    adapter.handle_message = AsyncMock()
+    adapter._decision_card_store.create(
+        platform="matrix",
+        room_id="!room:matrix.org",
+        message_id="$card",
+        body="Decision: D-1",
+        decision_id="D-1",
+    )
+
+    event = types.SimpleNamespace(
+        sender="@other:matrix.org",
+        event_id="$reaction",
+        room_id="!room:matrix.org",
+        content={"m.relates_to": {"event_id": "$card", "key": "✅"}},
+    )
+
+    await adapter._on_reaction(event)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_matrix_decision_reaction_respects_room_binding(tmp_path: Path):
+    from gateway.decision_cards import DecisionCardStore
+
+    adapter = _make_adapter()
+    adapter._decision_reactions_enabled = True
+    adapter._decision_card_store = DecisionCardStore(path=tmp_path / "cards.json")
+    adapter._allowed_user_ids = {"@josh:matrix.org"}
+    adapter.handle_message = AsyncMock()
+    adapter._decision_card_store.create(
+        platform="matrix",
+        room_id="!room-a:matrix.org",
+        message_id="$card",
+        body="Decision: D-1",
+        decision_id="D-1",
+    )
+
+    event = types.SimpleNamespace(
+        sender="@josh:matrix.org",
+        event_id="$reaction",
+        room_id="!room-b:matrix.org",
+        content={"m.relates_to": {"event_id": "$card", "key": "✅"}},
+    )
+
+    await adapter._on_reaction(event)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_matrix_decision_command_routes_by_id_in_same_room(tmp_path: Path):
+    from gateway.decision_cards import DecisionCardStore
+
+    adapter = _make_adapter()
+    adapter._decision_reactions_enabled = True
+    adapter._decision_card_store = DecisionCardStore(path=tmp_path / "cards.json")
+    adapter._allowed_user_ids = {"@josh:matrix.org"}
+    adapter._client = None
+    adapter.handle_message = AsyncMock()
+    adapter._decision_card_store.create(
+        platform="matrix",
+        room_id="!room:matrix.org",
+        message_id="$card",
+        body="Decision: D-1\nProposed action: update pending-decisions.md",
+        decision_id="D-1",
+    )
+
+    handled = await adapter._handle_decision_card_command(
+        room_id="!room:matrix.org",
+        sender="@josh:matrix.org",
+        event_id="$cmd",
+        body="approve D-1",
+    )
+
+    assert handled is True
+    adapter.handle_message.assert_awaited_once()
+    msg = adapter.handle_message.await_args.args[0]
+    assert "Decision ID: D-1" in msg.text
+    assert "Action: approve" in msg.text
+
+
+@pytest.mark.asyncio
+async def test_matrix_decision_command_rejects_other_room(tmp_path: Path):
+    from gateway.decision_cards import DecisionCardStore
+
+    adapter = _make_adapter()
+    adapter._decision_reactions_enabled = True
+    adapter._decision_card_store = DecisionCardStore(path=tmp_path / "cards.json")
+    adapter._allowed_user_ids = {"@josh:matrix.org"}
+    adapter.send = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    adapter._decision_card_store.create(
+        platform="matrix",
+        room_id="!room-a:matrix.org",
+        message_id="$card",
+        body="Decision: D-1",
+        decision_id="D-1",
+    )
+
+    handled = await adapter._handle_decision_card_command(
+        room_id="!room-b:matrix.org",
+        sender="@josh:matrix.org",
+        event_id="$cmd",
+        body="approve D-1",
+    )
+
+    assert handled is True
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
