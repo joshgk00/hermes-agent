@@ -29,6 +29,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.decision_cards import DecisionCard, DecisionCardStore, default_expiry_iso, extract_decision_id
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,18 @@ class MattermostAdapter(BasePlatformAdapter):
         # not pass through the normal message authorization flow, so the
         # reaction handler validates MATTERMOST_ALLOWED_USERS before resolving.
         self._approval_reaction_state: Dict[str, Dict[str, str]] = {}
+        self._decision_reactions_enabled: bool = config.extra.get(
+            "decision_reactions",
+            os.getenv("MATTERMOST_DECISION_REACTIONS", "true").lower()
+            in {"true", "1", "yes"},
+        )
+        self._decision_reaction_expiry_days: int = int(
+            config.extra.get(
+                "decision_reaction_expiry_days",
+                os.getenv("MATTERMOST_DECISION_REACTION_EXPIRY_DAYS", "14"),
+            )
+        )
+        self._decision_card_store = DecisionCardStore()
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -304,6 +317,7 @@ class MattermostAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
 
+        first_id = None
         last_id = None
         for chunk in chunks:
             payload: Dict[str, Any] = {
@@ -318,8 +332,77 @@ class MattermostAdapter(BasePlatformAdapter):
             if not data or "id" not in data:
                 return SendResult(success=False, error="Failed to create post")
             last_id = data["id"]
+            if first_id is None:
+                first_id = last_id
+
+        if first_id and self._should_add_decision_card_reactions(content, metadata):
+            await self.register_decision_card(
+                channel_id=chat_id,
+                post_id=str(first_id),
+                body=content,
+                decision_id=extract_decision_id(content),
+                thread_id=(metadata or {}).get("thread_id"),
+            )
+            for emoji_name in ("white_check_mark", "x", "wastebasket"):
+                try:
+                    await self._api_post(
+                        "reactions",
+                        {
+                            "user_id": self._bot_user_id,
+                            "post_id": str(first_id),
+                            "emoji_name": emoji_name,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Mattermost: failed to seed decision reaction %s: %s", emoji_name, exc)
 
         return SendResult(success=True, message_id=last_id)
+
+    def _should_add_decision_card_reactions(
+        self, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Return true when an outgoing message is an actionable decision card."""
+        if not getattr(self, "_decision_reactions_enabled", False):
+            return False
+        if metadata and metadata.get("decision_card_reactions") is True:
+            return True
+        if not content:
+            return False
+        normalized = content.lower()
+        return (
+            "decision moment" in normalized
+            and "✅" in content
+            and "❌" in content
+        )
+
+    async def register_decision_card(
+        self,
+        *,
+        channel_id: str,
+        post_id: str,
+        body: str,
+        decision_id: str | None = None,
+        actions: dict[str, str] | None = None,
+        expires_at: str | None = None,
+        session_key: str | None = None,
+        thread_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> DecisionCard:
+        """Register a sent Mattermost post as a reaction-addressable decision card."""
+        if expires_at is None:
+            expires_at = default_expiry_iso(self._decision_reaction_expiry_days)
+        return self._decision_card_store.create(
+            platform="mattermost",
+            room_id=channel_id,
+            message_id=post_id,
+            body=body,
+            decision_id=decision_id,
+            actions=actions,
+            expires_at=expires_at,
+            session_key=session_key,
+            thread_id=thread_id,
+            metadata=metadata,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return channel name and type."""
@@ -775,6 +858,7 @@ class MattermostAdapter(BasePlatformAdapter):
         post_id = str(reaction.get("post_id") or "")
         state = self._approval_reaction_state.get(post_id)
         if not state:
+            await self._handle_decision_card_reaction(reaction)
             return
 
         user_id = str(reaction.get("user_id") or "")
@@ -837,6 +921,116 @@ class MattermostAdapter(BasePlatformAdapter):
             label_map.get(choice, f"Resolved by {user_id}"),
             metadata={"thread_id": post_id},
         )
+
+    def _mattermost_decision_action_for_emoji(self, emoji_name: str) -> str | None:
+        emoji = (emoji_name or "").strip().lower()
+        return {
+            "white_check_mark": "approve",
+            "heavy_check_mark": "approve",
+            "check": "approve",
+            "x": "deny",
+            "negative_squared_cross_mark": "deny",
+            "no_entry_sign": "deny",
+            "wastebasket": "close",
+            "put_litter_in_its_place": "close",
+        }.get(emoji)
+
+    def _is_authorized_reaction_user(self, user_id: str) -> bool:
+        if not user_id or user_id == self._bot_user_id:
+            return False
+        allowed_csv = os.getenv("MATTERMOST_ALLOWED_USERS", "").strip()
+        if not allowed_csv:
+            return True
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        return "*" in allowed_ids or user_id in allowed_ids
+
+    def _build_decision_reaction_text(
+        self,
+        *,
+        card: DecisionCard,
+        action: str,
+        sender: str,
+        post_id: str,
+    ) -> str:
+        return (
+            "Mattermost decision reaction received.\n\n"
+            f"Decision ID: {card.decision_id}\n"
+            f"Action: {action}\n"
+            f"Reacting user: {sender}\n"
+            f"Channel: {card.room_id}\n"
+            f"Original post: {post_id}\n\n"
+            "Decision card:\n"
+            f"{card.body}\n\n"
+            "Apply the approved action. If the target is missing or unsafe, explain the blocker instead of guessing."
+        )
+
+    async def _handle_decision_card_reaction(self, reaction: Dict[str, Any]) -> bool:
+        """Dispatch a synthetic message for a registered Mattermost decision-card reaction."""
+        if not getattr(self, "_decision_reactions_enabled", False):
+            return False
+        post_id = str(reaction.get("post_id") or "")
+        if not post_id:
+            return False
+        store = getattr(self, "_decision_card_store", None)
+        if store is None:
+            return False
+        card = store.get_by_message_id(post_id)
+        if card is None:
+            return False
+        if card.platform != "mattermost":
+            return True
+
+        user_id = str(reaction.get("user_id") or "")
+        if not self._is_authorized_reaction_user(user_id):
+            logger.info(
+                "Mattermost: ignoring decision reaction from unauthorized user %s on %s",
+                user_id,
+                post_id,
+            )
+            return True
+
+        base_action = self._mattermost_decision_action_for_emoji(
+            str(reaction.get("emoji_name") or "")
+        )
+        if not base_action:
+            return True
+        action = card.actions.get({"approve": "✅", "deny": "❌", "close": "🗑️"}.get(base_action, ""), base_action)
+        resolved = store.resolve(post_id, action=action, user_id=user_id)
+        if resolved is None:
+            await self.send(
+                card.room_id,
+                f"Decision {card.decision_id} is expired or unavailable.",
+                metadata={"thread_id": post_id},
+            )
+            return True
+
+        source = self.build_source(
+            chat_id=resolved.room_id,
+            chat_type="group",
+            user_id=user_id,
+            user_name=user_id,
+            thread_id=resolved.thread_id,
+        )
+        msg_event = MessageEvent(
+            text=self._build_decision_reaction_text(
+                card=resolved,
+                action=resolved.resolved_action or action,
+                sender=user_id,
+                post_id=post_id,
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={
+                "decision_card": resolved.__dict__,
+                "decision_action": resolved.resolved_action or action,
+                "reaction": reaction,
+            },
+            message_id=str(reaction.get("create_at") or post_id),
+            reply_to_message_id=post_id,
+            reply_to_text=resolved.body,
+        )
+        await self.handle_message(msg_event)
+        return True
 
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         """Process a single WebSocket event."""
@@ -1260,6 +1454,10 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
+    if "decision_reactions" in mattermost_cfg and not os.getenv("MATTERMOST_DECISION_REACTIONS"):
+        os.environ["MATTERMOST_DECISION_REACTIONS"] = str(mattermost_cfg["decision_reactions"]).lower()
+    if "decision_reaction_expiry_days" in mattermost_cfg and not os.getenv("MATTERMOST_DECISION_REACTION_EXPIRY_DAYS"):
+        os.environ["MATTERMOST_DECISION_REACTION_EXPIRY_DAYS"] = str(mattermost_cfg["decision_reaction_expiry_days"])
     frc = mattermost_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):

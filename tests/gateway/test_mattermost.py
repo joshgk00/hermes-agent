@@ -903,3 +903,116 @@ class TestMattermostMediaTypes:
         assert msg.media_types == ["application/pdf"]
         assert not msg.media_types[0].startswith("image/")
         assert not msg.media_types[0].startswith("audio/")
+
+
+# ---------------------------------------------------------------------------
+# Decision card reactions
+# ---------------------------------------------------------------------------
+
+class TestMattermostDecisionCards:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter._session = MagicMock()
+        self.adapter.handle_message = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_send_registers_decision_card_and_seeds_reactions(self, tmp_path):
+        from gateway.decision_cards import DecisionCardStore
+
+        self.adapter._decision_card_store = DecisionCardStore(tmp_path / "cards.json")
+        self.adapter._decision_reaction_expiry_days = 14
+
+        async def fake_api_post(path, payload):
+            if path == "posts":
+                return {"id": "post_decision"}
+            return {"ok": True}
+
+        self.adapter._api_post = AsyncMock(side_effect=fake_api_post)
+        body = (
+            "**Decision Moment: Test Mattermost cards**\n\n"
+            "Decision ID: `D-mm-1`\n\n"
+            "React/reply:\n✅ approve / proceed\n❌ deny / keep\n🗑️ close without applying"
+        )
+
+        result = await self.adapter.send("chan_1", body)
+
+        assert result.success is True
+        card = self.adapter._decision_card_store.get_by_message_id("post_decision")
+        assert card is not None
+        assert card.platform == "mattermost"
+        assert card.room_id == "chan_1"
+        assert card.decision_id == "D-mm-1"
+        reaction_payloads = [c.args[1] for c in self.adapter._api_post.call_args_list if c.args[0] == "reactions"]
+        assert [p["emoji_name"] for p in reaction_payloads] == ["white_check_mark", "x", "wastebasket"]
+
+    @pytest.mark.asyncio
+    async def test_allowed_reaction_dispatches_decision_card_action(self, tmp_path, monkeypatch):
+        from gateway.decision_cards import DecisionCardStore
+
+        self.adapter._decision_card_store = DecisionCardStore(tmp_path / "cards.json")
+        self.adapter._decision_card_store.create(
+            platform="mattermost",
+            room_id="chan_1",
+            message_id="post_decision",
+            body="Decision ID: `D-mm-1`\n✅ approve\n❌ deny",
+            decision_id="D-mm-1",
+            thread_id="thread_1",
+        )
+        monkeypatch.setenv("MATTERMOST_ALLOWED_USERS", "user_123")
+
+        event = {
+            "event": "reaction_added",
+            "data": {
+                "reaction": json.dumps({
+                    "post_id": "post_decision",
+                    "user_id": "user_123",
+                    "emoji_name": "white_check_mark",
+                })
+            }
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        card = self.adapter._decision_card_store.get_by_message_id("post_decision")
+        assert card.resolved is True
+        assert card.resolved_action == "approve"
+        self.adapter.handle_message.assert_awaited_once()
+        msg = self.adapter.handle_message.call_args.args[0]
+        assert msg.source.platform == Platform.MATTERMOST
+        assert msg.source.chat_id == "chan_1"
+        assert msg.source.thread_id == "thread_1"
+        assert msg.reply_to_message_id == "post_decision"
+        assert "Decision ID: D-mm-1" in msg.text
+        assert "Action: approve" in msg.text
+        assert "Decision card:" in msg.text
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_decision_reaction_does_not_resolve(self, tmp_path, monkeypatch):
+        from gateway.decision_cards import DecisionCardStore
+
+        self.adapter._decision_card_store = DecisionCardStore(tmp_path / "cards.json")
+        self.adapter._decision_card_store.create(
+            platform="mattermost",
+            room_id="chan_1",
+            message_id="post_decision",
+            body="Decision ID: `D-mm-1`\n✅ approve\n❌ deny",
+            decision_id="D-mm-1",
+        )
+        monkeypatch.setenv("MATTERMOST_ALLOWED_USERS", "allowed_user")
+        event = {
+            "event": "reaction_added",
+            "data": {
+                "reaction": json.dumps({
+                    "post_id": "post_decision",
+                    "user_id": "intruder",
+                    "emoji_name": "white_check_mark",
+                })
+            }
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        card = self.adapter._decision_card_store.get_by_message_id("post_decision")
+        assert card.resolved is False
+        self.adapter.handle_message.assert_not_awaited()
