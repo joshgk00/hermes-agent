@@ -1339,14 +1339,18 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    _deadline = None if timeout <= 0 else _now + timeout
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
+        if _deadline is None:
+            _remaining = None
+        else:
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                break
+        wait_seconds = 1.0 if _remaining is None else min(1.0, _remaining)
+        if entry.event.wait(timeout=wait_seconds):
             resolved = True
             break
         if touch_activity_if_due is not None:
