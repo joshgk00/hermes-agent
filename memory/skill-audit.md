@@ -18,3 +18,8 @@
 ## 2026-06-25 Nightly Maintenance
 - `decision-moment-cards`: Lines 115-149 duplicate delivery precedence and direct-send recovery cases already covered by the cron-specific bullets. Suggested fix: keep the no-send precedence plus card schema in SKILL.md and move Matrix/Mattermost implementation notes to references. Estimated savings/impact: ~500 tokens and fewer delivery conflicts.
 - `nightly-maintenance-routine`: Lines 65-82 include detailed secret-scan examples while linked triage references exist. Suggested fix: keep critical/benign classification rules in SKILL.md and move concrete examples to `references/security-scan-triage.md`. Estimated savings/impact: ~200 tokens.
+
+## 2026-06-26 Nightly Maintenance
+- `decision-moment-cards`: Prior Matrix/Mattermost delivery-plumbing issue still open; the loaded skill spends most cron guidance on transport fallback details. Suggested fix: move fallback send/register procedures to linked references and keep only card format plus delivery precedence in SKILL.md. Estimated savings/impact: ~500-700 tokens and fewer auto-delivery conflicts.
+- `prompt-optimization-analyzer`: Lines 84-110 still carry two examples after the audit format is specified. Suggested fix: keep one compact example and move the second to references or delete it. Estimated savings/impact: ~150 tokens.
+- `nightly-maintenance-routine`: Security-scan section still embeds detailed benign-match examples despite linked triage references. Suggested fix: keep escalation criteria in SKILL.md and move examples to `references/security-scan-triage.md`. Estimated savings/impact: ~200 tokens.
