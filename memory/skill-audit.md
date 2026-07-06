@@ -43,3 +43,8 @@
 - `decision-moment-cards`: Prior delivery-plumbing issue still open; loaded skill still includes long Matrix/Mattermost direct-send and manual-registration runbooks. Suggested fix: keep delivery precedence and card schema in SKILL.md; move send/register recovery details to references. Estimated savings/impact: ~1,200 tokens and lower cron conflict risk.
 - `prompt-optimization-analyzer`: Prior XML/context duplication issue still open. Suggested fix: merge `<context>` and `<role>` into one purpose sentence before the rubric. Estimated savings/impact: ~80-120 tokens.
 - `nightly-maintenance-routine`: Prior secret-scan triage duplication still open. Suggested fix: keep scope, escalation rules, and reference links in SKILL.md; move concrete benign-match examples to linked references. Estimated savings/impact: ~250-400 tokens.
+
+## 2026-07-06 Nightly Maintenance
+- `decision-moment-cards`: Prior delivery-plumbing issue still open; loaded skill still carries direct Matrix/Mattermost send and registration runbooks in trigger-time context. Suggested fix: keep card schema and no-send precedence in SKILL.md; move fallback transport procedures to references. Estimated savings/impact: ~1,200 tokens and lower cron conflict risk.
+- `prompt-optimization-analyzer`: Prior XML/context duplication issue still open. Suggested fix: merge `<context>` and `<role>` into one purpose sentence before the rubric. Estimated savings/impact: ~80-120 tokens.
+- `nightly-maintenance-routine`: Prior secret-scan triage duplication still open; detailed benign-match examples duplicate linked references. Suggested fix: keep scan scope and escalation criteria in SKILL.md; move example lists to references. Estimated savings/impact: ~250-400 tokens.
