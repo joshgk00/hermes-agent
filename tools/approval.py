@@ -2484,16 +2484,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    _deadline = None if timeout <= 0 else _now + timeout
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
         # Respect interrupt signals (e.g. /stop, /new, or an inactivity
         # timeout from the gateway) so a pending approval doesn't keep the
-        # session wedged on threading.Event.wait() until the 5-minute approval
-        # timeout. The wait runs on the agent's execution thread, which is the
-        # exact thread AIAgent.interrupt() flags — so is_interrupted() here
-        # sees the signal. Resolve as "deny" so the agent loop receives a
+        # session wedged. Resolve as "deny" so the agent loop receives a
         # normal denial and unwinds cleanly (#8697).
         if is_interrupted():
             logger.info(
@@ -2505,10 +2502,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             entry.event.set()
             resolved = True
             break
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
+        if _deadline is None:
+            _remaining = None
+        else:
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                break
+        wait_seconds = 1.0 if _remaining is None else min(1.0, _remaining)
+        if entry.event.wait(timeout=wait_seconds):
             resolved = True
             break
         if touch_activity_if_due is not None:
