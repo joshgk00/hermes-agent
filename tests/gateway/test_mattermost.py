@@ -597,6 +597,39 @@ class TestMattermostWebSocketParsing:
         assert msg_event.message_id == "post_abc"
 
     @pytest.mark.asyncio
+    async def test_thread_reply_includes_root_post_as_reply_context(self):
+        """A reply to a delivered bot post should carry that post into the agent turn."""
+        self.adapter._api_get = AsyncMock(return_value={
+            "id": "cron_status_post",
+            "user_id": "bot_user_id",
+            "message": "Paperless OCR completed: 3 documents processed.",
+        })
+        post_data = {
+            "id": "user_reply",
+            "root_id": "cron_status_post",
+            "user_id": "user_123",
+            "channel_id": "chan_456",
+            "message": "@hermes-bot Why did one document fail?",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "O",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        self.adapter._api_get.assert_awaited_once_with("posts/cron_status_post")
+        assert msg_event.reply_to_message_id == "cron_status_post"
+        assert msg_event.reply_to_text == "Paperless OCR completed: 3 documents processed."
+        assert msg_event.reply_to_author_id == "bot_user_id"
+        assert msg_event.reply_to_is_own_message is True
+
+    @pytest.mark.asyncio
     async def test_ignore_own_messages(self):
         """Messages from the bot's own user_id should be ignored."""
         post_data = {
@@ -810,10 +843,13 @@ class TestMattermostWebSocketParsing:
             },
         }
 
+        self.adapter._api_get = AsyncMock(return_value={})
         await self.adapter._handle_ws_event(event)
         assert self.adapter.handle_message.called
         msg_event = self.adapter.handle_message.call_args[0][0]
         assert msg_event.source.thread_id == "root_post_123"
+        assert msg_event.reply_to_message_id == "root_post_123"
+        assert msg_event.reply_to_text is None
 
     @pytest.mark.asyncio
     async def test_invalid_post_json_ignored(self):

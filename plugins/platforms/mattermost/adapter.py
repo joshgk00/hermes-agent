@@ -1218,7 +1218,23 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Thread support: if the post is in a thread, use root_id. In
         # thread mode, top-level channel posts are valid roots for progress.
-        thread_id = post.get("root_id") or None
+        reply_to_message_id = post.get("root_id") or None
+        reply_to_text = None
+        reply_to_author_id = None
+        reply_to_is_own_message = False
+        if reply_to_message_id:
+            # Mattermost thread replies identify the root post but do not carry
+            # its text in the WebSocket event. Fetch it so the shared gateway
+            # reply-context path can tell the model what the user replied to.
+            root_post = await self._api_get(f"posts/{reply_to_message_id}")
+            if root_post:
+                reply_to_text = root_post.get("message") or None
+                reply_to_author_id = root_post.get("user_id") or None
+                reply_to_is_own_message = bool(
+                    reply_to_author_id and reply_to_author_id == self._bot_user_id
+                )
+
+        thread_id = reply_to_message_id
         if (
             not thread_id
             and self._reply_mode == "thread"
@@ -1304,6 +1320,10 @@ class MattermostAdapter(BasePlatformAdapter):
             source=source,
             raw_message=post,
             message_id=post_id,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id,
+            reply_to_is_own_message=reply_to_is_own_message,
             media_urls=media_urls if media_urls else None,
             media_types=media_types if media_types else None,
             channel_prompt=_channel_prompt,
