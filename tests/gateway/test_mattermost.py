@@ -558,6 +558,38 @@ class TestMattermostSend:
             "x",
         ]
 
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_honors_restricted_scope(self):
+        """Smart-deny prompts must expose only one-operation approval and denial."""
+        calls = []
+
+        async def fake_api_post(path, payload):
+            calls.append((path, payload))
+            if path == "posts":
+                return {"id": "restricted_approval_post"}
+            return {"ok": True}
+
+        self.adapter._bot_user_id = "bot_user"
+        self.adapter._api_post = fake_api_post
+
+        result = await self.adapter.send_exec_approval(
+            "channel_1",
+            "run restricted operation",
+            "session_1",
+            allow_permanent=False,
+            smart_denied=True,
+        )
+
+        assert result.success is True
+        assert "```\nrun restricted operation\n```" in calls[0][1]["message"]
+        assert "🟦" not in calls[0][1]["message"]
+        assert "♾️" not in calls[0][1]["message"]
+        assert self.adapter._approval_reaction_state["restricted_approval_post"]["allowed_choices"] == {"once", "deny"}
+        assert [payload["emoji_name"] for path, payload in calls[1:] if path == "reactions"] == [
+            "white_check_mark",
+            "x",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # WebSocket event parsing

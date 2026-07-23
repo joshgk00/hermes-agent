@@ -118,7 +118,7 @@ class MattermostAdapter(BasePlatformAdapter):
         # Approval prompts keyed by the Mattermost post ID. Reaction events do
         # not pass through the normal message authorization flow, so the
         # reaction handler validates MATTERMOST_ALLOWED_USERS before resolving.
-        self._approval_reaction_state: Dict[str, Dict[str, str]] = {}
+        self._approval_reaction_state: Dict[str, Dict[str, Any]] = {}
         self._decision_reactions_enabled: bool = config.extra.get(
             "decision_reactions",
             os.getenv("MATTERMOST_DECISION_REACTIONS", "true").lower()
@@ -530,15 +530,30 @@ class MattermostAdapter(BasePlatformAdapter):
         session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         """Send a Mattermost approval prompt that resolves through reactions."""
         cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
+        if smart_denied:
+            choices = "React with ✅ to allow once or ❌ to deny."
+            reaction_choices = ("white_check_mark", "x")
+            allowed_choices = {"once", "deny"}
+        else:
+            choices = "React with ✅ to allow once or 🟦 to allow for this session"
+            reaction_choices = ("white_check_mark", "blue_square")
+            allowed_choices = {"once", "session", "deny"}
+            if allow_permanent:
+                choices += ", ♾️ to always allow"
+                reaction_choices += ("infinity",)
+                allowed_choices.add("always")
+            choices += ", or ❌ to deny."
+            reaction_choices += ("x",)
         message = (
             "⚠️ **Command approval required**\n"
             f"```\n{cmd_preview}\n```\n"
             f"Reason: {description}\n\n"
-            "React with ✅ to allow once, 🟦 to allow for this session, "
-            "♾️ to always allow, or ❌ to deny."
+            f"{choices} Text fallback: `/approve` or `/deny`."
         )
         result = await self.send(chat_id, message, metadata=metadata)
         if not result.success or not result.message_id:
@@ -547,11 +562,12 @@ class MattermostAdapter(BasePlatformAdapter):
         self._approval_reaction_state[str(result.message_id)] = {
             "session_key": session_key,
             "chat_id": chat_id,
+            "allowed_choices": allowed_choices,
         }
 
         # Seed the post with the available choices. If the bot lacks reaction
         # permission, the text instructions still let desktop clients approve.
-        for emoji_name in ("white_check_mark", "blue_square", "infinity", "x"):
+        for emoji_name in reaction_choices:
             try:
                 await self._api_post(
                     "reactions",
@@ -973,6 +989,8 @@ class MattermostAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(emoji_name)
         if not choice:
+            return
+        if choice not in state.get("allowed_choices", {"once", "session", "always", "deny"}):
             return
 
         state = self._approval_reaction_state.pop(post_id, None)
