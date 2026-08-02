@@ -353,6 +353,43 @@ def _redact_approval_command(cmd: "str | None") -> str:
     return redact_sensitive_text(str(cmd or ""), force=True)
 
 
+def _ntfy_approval_fanout_adapter(runner, source):
+    """Return the same-profile ntfy adapter when approval fanout is enabled.
+
+    Adapters only enter the runner maps after connecting successfully.  Keep
+    this lookup profile-aware and avoid notifying ntfy about an approval that
+    already originated on ntfy itself.
+    """
+    if source is None or getattr(source, "platform", None) == Platform("ntfy"):
+        return None
+    try:
+        adapter = runner._authorization_adapter(
+            Platform("ntfy"), getattr(source, "profile", None)
+        )
+    except Exception:
+        return None
+    if not adapter or not getattr(adapter, "approval_notifications_enabled", False):
+        return None
+    if getattr(type(adapter), "send_exec_approval", None) is None:
+        return None
+    return adapter
+
+
+def _mattermost_approval_permalink(source, adapter, event_message_id: str | None) -> str | None:
+    """Build a browser link to the current Mattermost post without an API call."""
+    if source is None or getattr(source, "platform", None) != Platform.MATTERMOST:
+        return None
+    base_url = str(getattr(adapter, "_base_url", "") or "").rstrip("/")
+    post_id = (
+        event_message_id
+        or getattr(source, "message_id", None)
+        or getattr(source, "thread_id", None)
+    )
+    if not base_url or not post_id:
+        return None
+    return f"{base_url}/_redirect/pl/{post_id}"
+
+
 def _format_exec_approval_fallback(
     command: str,
     description: str,
@@ -20653,6 +20690,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (send_exec_approval) and plain-text fallback paths below use
                 # the redacted value.
                 cmd = _redact_approval_command(cmd)
+
+                # Optional cross-platform fanout.  This is deliberately
+                # additive: the originating platform still receives its
+                # normal button/text prompt and remains able to resolve the
+                # same approval.  The ntfy adapter maps its opaque response
+                # token back to this exact session; tools.approval provides
+                # the shared first-resolution-wins queue.
+                _ntfy_approval_adapter = _ntfy_approval_fanout_adapter(self, source)
+                if _ntfy_approval_adapter is not None:
+                    try:
+                        _ntfy_fut = safe_schedule_threadsafe(
+                            _ntfy_approval_adapter.send_exec_approval(
+                                command=cmd,
+                                description=desc,
+                                session_key=_approval_session_key,
+                                open_url=_mattermost_approval_permalink(
+                                    source, _status_adapter, event_message_id
+                                ),
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="ntfy approval fanout scheduling error",
+                        )
+                        if _ntfy_fut is not None:
+                            def _log_ntfy_fanout_result(fut) -> None:
+                                try:
+                                    result = fut.result()
+                                except Exception as exc:
+                                    logger.warning("ntfy approval fanout failed: %s", exc)
+                                    return
+                                if not getattr(result, "success", False):
+                                    logger.warning(
+                                        "ntfy approval fanout failed: %s",
+                                        getattr(result, "error", "unknown error"),
+                                    )
+
+                            _ntfy_fut.add_done_callback(_log_ntfy_fanout_result)
+                    except Exception as _e:
+                        # Fanout is supplemental; failure must never suppress
+                        # or fail the originating platform's approval prompt.
+                        logger.warning("ntfy approval fanout failed: %s", _e)
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids

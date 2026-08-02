@@ -46,6 +46,61 @@ NTFY_HOME_CHANNEL=hermes-myname-2026
 | `NTFY_HOME_CHANNEL` | Optional | Default topic for cron / notification delivery |
 | `NTFY_HOME_CHANNEL_NAME` | Optional | Human label for the home channel |
 
+## Cross-platform approval notifications
+
+ntfy can mirror dangerous-command approval requests raised in another
+connected gateway session (for example, Mattermost or Telegram) to your phone.
+This is opt-in and is disabled by default. Configure it in `config.yaml`:
+
+```yaml
+platforms:
+  ntfy:
+    enabled: true
+    extra:
+      server: https://ntfy.example.com
+      topic: hermes-approval-responses
+      publish_topic: hermes-alerts
+      token: tk_example
+      approval_notifications: true
+      approval_expiry_seconds: 60
+```
+
+`approval_expiry_seconds` is finite and clamped to 1–3600 seconds; the default
+is 60 seconds, matching the default Hermes approval timeout. Pending approval
+state is memory-only, bounded to 128 requests, and cleared when the adapter
+disconnects.
+
+The notification uses native ntfy actions:
+
+- **Approve once** approves only the exact pending operation in its original
+  gateway session.
+- **Deny** denies that operation.
+- **Open thread** appears for Mattermost when Hermes can construct a browser
+  permalink. The link targets the current triggering post/thread. Hermes does
+  not make a synchronous Mattermost latest-post lookup while the approval
+  callback is blocked, so it may not point to a reply posted moments later.
+
+The originating platform always keeps its normal approval prompt. Whichever
+valid prompt resolves first wins; later clicks are rejected as stale or reused.
+Unknown and expired response IDs are also consumed and rejected before they can
+become normal agent messages.
+
+### Approval-action security
+
+Hermes does **not** expose a public approval HTTP endpoint. Each Approve/Deny
+button publishes a random, one-time opaque response to the configured
+`topic` (the subscribed topic, not `publish_topic`). The notification contains
+neither the original Hermes session key nor `NTFY_TOKEN`, and the action does
+not put an `Authorization` header in its metadata.
+
+That means the response topic must accept the ntfy client's action POST without
+embedding credentials. On a self-hosted server, use a dedicated, long,
+unguessable response topic with read access restricted to Hermes and narrowly
+scoped write access for the action client. If your server requires an explicit
+bearer header for every publish, the native buttons will be rejected by ntfy;
+do not work around this by putting the bearer token in action headers. The
+original platform prompt remains available when ntfy fanout fails.
+
 ## Identity model — read this before deploying
 
 ntfy has no native authenticated user identity. The `title` field on a published message is **publisher-controlled** and can be anything the sender wants. The Hermes adapter does NOT use `title` for authorization — it would let any publisher who knows the topic spoof an allowed user.
@@ -145,6 +200,8 @@ If you only want Hermes to *push* notifications to ntfy (cron summaries, alerts)
 - **No typing indicators**: the protocol doesn't expose one; `send_typing` is a no-op.
 - **No threads or attachments**: ntfy is plain push notifications. Long replies stay in the message body, no thread fanout.
 - **No native user identity**: see the identity-model section above.
+- **Mattermost approval link**: points to the triggering post/thread without a
+  live latest-reply lookup, so it can lag replies added after the request.
 
 ## Troubleshooting
 

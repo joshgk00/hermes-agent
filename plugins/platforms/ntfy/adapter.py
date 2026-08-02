@@ -48,8 +48,10 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -82,6 +84,27 @@ DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 STREAM_TIMEOUT_SECONDS = 90  # ntfy keepalive default is 55s; give margin
 _ECHO_TAG = "hermes-agent"  # tag added to outgoing messages for echo-loop prevention
+_APPROVAL_RESPONSE_PREFIX = "hermes-approval:"
+_MAX_PENDING_APPROVALS = 128
+_DEFAULT_APPROVAL_EXPIRY_SECONDS = 60
+
+
+def _config_bool(value: Any, default: bool = False) -> bool:
+    """Parse a config/env boolean without treating non-empty ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """Return a bounded positive integer for user-controlled expiry config."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(parsed, 3600))
 
 
 def _build_auth_header(token: str) -> Dict[str, str]:
@@ -123,16 +146,12 @@ def _truncate_body(message: str, *, context: str) -> bytes:
 
 
 def check_requirements() -> bool:
-    """Check whether the ntfy adapter is installable and minimally configured.
+    """Return whether the ntfy adapter's HTTP dependency is available.
 
-    Reads ``NTFY_TOPIC`` directly to avoid the cost of a full
-    ``load_gateway_config()`` (which also writes to ``os.environ``) on
-    every pre-flight check.
+    Topic configuration is validated separately by ``validate_config`` so
+    registry preflight works for both config.yaml and environment-only setups.
     """
-    if not HTTPX_AVAILABLE:
-        return False
-    topic = os.getenv("NTFY_TOPIC", "").strip()
-    return bool(topic)
+    return HTTPX_AVAILABLE
 
 
 def validate_config(config) -> bool:
@@ -174,12 +193,27 @@ class NtfyAdapter(BasePlatformAdapter):
             or self._topic
         )
         self._token: str = extra.get("token") or os.getenv("NTFY_TOKEN", "")
+        self.approval_notifications_enabled: bool = _config_bool(
+            extra.get("approval_notifications"),
+            _config_bool(os.getenv("NTFY_APPROVAL_NOTIFICATIONS"), False),
+        )
+        self._approval_expiry_seconds: int = _positive_int(
+            extra.get("approval_expiry_seconds"),
+            _DEFAULT_APPROVAL_EXPIRY_SECONDS,
+        )
 
         self._stream_task: Optional[asyncio.Task] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
 
         # Message deduplication: msg_id -> timestamp
         self._seen_messages: Dict[str, float] = {}
+
+        # Cross-platform approval responses live only in this process.  The
+        # request map is ordered so the hard cap can evict the oldest request;
+        # the token map makes inbound lookup constant-time.  Both are accessed
+        # only on the adapter's gateway event loop.
+        self._pending_approvals: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._approval_tokens: Dict[str, tuple[str, str]] = {}
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -301,6 +335,8 @@ class NtfyAdapter(BasePlatformAdapter):
             self._http_client = None
 
         self._seen_messages.clear()
+        self._pending_approvals.clear()
+        self._approval_tokens.clear()
         logger.info("[%s] Disconnected", self.name)
 
     # -- Inbound message processing -----------------------------------------
@@ -321,6 +357,14 @@ class NtfyAdapter(BasePlatformAdapter):
         text = (event.get("message") or "").strip()
         if not text:
             logger.debug("[%s] Empty message body, skipping", self.name)
+            return
+
+        # Native ntfy action buttons publish an opaque one-time token back to
+        # the subscribed topic.  Consume that control message before the base
+        # adapter can queue it behind the blocked agent or treat it as a new
+        # user turn.
+        if text.startswith(_APPROVAL_RESPONSE_PREFIX):
+            self._handle_approval_response(text)
             return
 
         topic = event.get("topic") or self._topic
@@ -428,6 +472,151 @@ class NtfyAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Send error: %s", self.name, e)
             return SendResult(success=False, error=str(e))
+
+    async def send_exec_approval(
+        self,
+        *,
+        command: str,
+        description: str,
+        session_key: str,
+        open_url: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = False,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Publish a native ntfy approval card for another gateway session.
+
+        The action URLs point back to the configured subscribe topic on ntfy,
+        not to Hermes.  Their bodies contain only random, single-use tokens;
+        neither the original session key nor this adapter's auth token leaves
+        the process in the action metadata.  The extra keyword arguments match
+        the gateway's native approval capability contract; ntfy intentionally
+        offers only one-operation approval and denial.
+        """
+        if not self.approval_notifications_enabled:
+            return SendResult(success=False, error="ntfy approval notifications disabled")
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+
+        self._prune_approval_requests()
+        while len(self._pending_approvals) >= _MAX_PENDING_APPROVALS:
+            oldest_request_id = next(iter(self._pending_approvals))
+            self._drop_approval_request(oldest_request_id)
+
+        request_id = uuid.uuid4().hex
+        approve_token = secrets.token_urlsafe(24)
+        deny_token = secrets.token_urlsafe(24)
+        expires_at = time.monotonic() + self._approval_expiry_seconds
+        self._pending_approvals[request_id] = {
+            "session_key": session_key,
+            "expires_at": expires_at,
+            "tokens": (approve_token, deny_token),
+        }
+        self._approval_tokens[approve_token] = (request_id, "once")
+        self._approval_tokens[deny_token] = (request_id, "deny")
+
+        response_url = f"{self._server}/{self._topic}"
+        actions: List[Dict[str, Any]] = [
+            {
+                "action": "http",
+                "label": "Approve once",
+                "url": response_url,
+                "method": "POST",
+                "body": f"{_APPROVAL_RESPONSE_PREFIX}{approve_token}",
+                "clear": True,
+            },
+            {
+                "action": "http",
+                "label": "Deny",
+                "url": response_url,
+                "method": "POST",
+                "body": f"{_APPROVAL_RESPONSE_PREFIX}{deny_token}",
+                "clear": True,
+            },
+        ]
+        if open_url:
+            actions.append({
+                "action": "view",
+                "label": "Open thread",
+                "url": open_url,
+                "clear": False,
+            })
+
+        payload = {
+            "topic": self._publish_topic,
+            "title": "Hermes approval required",
+            "message": f"{description}\n\n{command}"[: self.MAX_MESSAGE_LENGTH],
+            "tags": ["warning", _ECHO_TAG],
+            "priority": 5,
+            "actions": actions,
+        }
+        try:
+            response = await self._http_client.post(
+                self._server,
+                json=payload,
+                headers=self._auth_headers(),
+                timeout=15.0,
+            )
+            if response.status_code < 300:
+                try:
+                    returned_id = response.json().get("id") or request_id[:12]
+                except Exception:
+                    returned_id = request_id[:12]
+                return SendResult(success=True, message_id=returned_id)
+            self._drop_approval_request(request_id)
+            return SendResult(
+                success=False,
+                error=f"HTTP {response.status_code}: {response.text[:200]}",
+            )
+        except Exception as exc:
+            self._drop_approval_request(request_id)
+            logger.error("[%s] Approval notification send error: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    def _handle_approval_response(self, text: str) -> bool:
+        """Resolve a pending gateway approval from an ntfy action response.
+
+        Prefix-matching messages are always intercepted, including unknown,
+        expired, and reused tokens.  Removing the entire two-token request
+        before resolving enforces first-resolution-wins on the event loop.
+        """
+        token = text[len(_APPROVAL_RESPONSE_PREFIX):].strip()
+        self._prune_approval_requests()
+        mapped = self._approval_tokens.get(token)
+        if not mapped:
+            logger.warning("[%s] Rejected unknown, expired, or reused approval response", self.name)
+            return False
+
+        request_id, choice = mapped
+        request = self._pending_approvals.get(request_id)
+        if not request or request["expires_at"] <= time.monotonic():
+            self._drop_approval_request(request_id)
+            logger.warning("[%s] Rejected expired approval response", self.name)
+            return False
+
+        session_key = request["session_key"]
+        self._drop_approval_request(request_id)
+        from tools.approval import resolve_gateway_approval
+
+        resolved = resolve_gateway_approval(session_key, choice)
+        if not resolved:
+            logger.warning("[%s] Rejected stale approval response", self.name)
+            return False
+        return True
+
+    def _prune_approval_requests(self) -> None:
+        now = time.monotonic()
+        for request_id, request in list(self._pending_approvals.items()):
+            if request["expires_at"] <= now:
+                self._drop_approval_request(request_id)
+
+    def _drop_approval_request(self, request_id: str) -> None:
+        request = self._pending_approvals.pop(request_id, None)
+        if not request:
+            return
+        for token in request["tokens"]:
+            self._approval_tokens.pop(token, None)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """ntfy does not support typing indicators."""
