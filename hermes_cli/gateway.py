@@ -5227,9 +5227,9 @@ _PLATFORMS = [
             },
             {
                 "name": "MATTERMOST_REPLY_MODE",
-                "prompt": "Reply mode — 'off' for flat messages, 'thread' for threaded replies (default: off)",
+                "prompt": "Reply mode — 'off', 'follow_thread', or 'thread' (default: off)",
                 "password": False,
-                "help": "off = flat channel messages, thread = replies nest under your message.",
+                "help": "off = always flat, follow_thread = flat unless the user is already in a Mattermost thread, thread = always nest under your message.",
             },
         ],
     },

@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import array
 import inspect
+
 import logging
 import mimetypes
 import os
@@ -73,6 +74,7 @@ from typing import Any, Dict, Optional, Set
 from agent.secret_scope import UnscopedSecretError, get_secret
 
 try:
+
     from mautrix.types import (
         ContentURI,
         EventID,
@@ -90,6 +92,7 @@ except ImportError:
     # check_matrix_requirements() will return False and the adapter
     # won't be instantiated in production, but tests may exercise
     # adapter methods so stubs must have the right attributes.
+
     ContentURI = EventID = RoomID = SyncToken = UserID = str  # type: ignore[misc,assignment]
 
     class _EventTypeStub:  # type: ignore[no-redef]
@@ -127,6 +130,7 @@ except ImportError:
     TrustState = _TrustStateStub  # type: ignore[misc,assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.decision_cards import DecisionCard, DecisionCardStore, default_expiry_iso, extract_decision_id
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -534,17 +538,23 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
 
+
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
 
 _OUTBOUND_MENTION_RE = re.compile(
     r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)"
 )
+_DECISION_COMMAND_RE = re.compile(
+    r"^\s*(approve|deny|close)\s+([A-Za-z0-9_.:-]+)\s*$", re.IGNORECASE
+)
 
 _E2EE_INSTALL_HINT = (
     "Install with: pip install 'mautrix[encryption]' asyncpg aiosqlite  "
     "(requires libolm C library)"
 )
+
+
 
 _MATRIX_IMAGE_FILENAME_EXTS = frozenset({
     ".jpg",
@@ -1187,6 +1197,18 @@ class MatrixAdapter(BasePlatformAdapter):
         # if that changes, add a config.yaml entry rather than an env var.
         self._reaction_redaction_delay_seconds = 5.0
         self._reaction_redaction_tasks: Set[asyncio.Task] = set()
+        self._decision_reactions_enabled: bool = config.extra.get(
+            "decision_reactions",
+            os.getenv("MATRIX_DECISION_REACTIONS", "false").lower()
+            in ("true", "1", "yes"),
+        )
+        self._decision_reaction_expiry_days: int = int(
+            config.extra.get(
+                "decision_reaction_expiry_days",
+                os.getenv("MATRIX_DECISION_REACTION_EXPIRY_DAYS", "14"),
+            )
+        )
+        self._decision_card_store = DecisionCardStore()
 
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
@@ -2047,6 +2069,7 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
 
+
         if self._client:
             try:
                 await self._client.api.session.close()
@@ -2071,6 +2094,7 @@ class MatrixAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.max_message_length)
 
+        first_event_id = None
         last_event_id = None
         for i, chunk in enumerate(chunks):
             msg_content = self._build_text_message_content(chunk)
@@ -2087,6 +2111,8 @@ class MatrixAdapter(BasePlatformAdapter):
                     timeout=45,
                 )
                 last_event_id = str(event_id)
+                if first_event_id is None:
+                    first_event_id = last_event_id
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
                 # On E2EE errors, retry after sharing keys.
@@ -2102,6 +2128,8 @@ class MatrixAdapter(BasePlatformAdapter):
                             timeout=45,
                         )
                         last_event_id = str(event_id)
+                        if first_event_id is None:
+                            first_event_id = last_event_id
                         logger.info(
                             "Matrix: sent event %s to %s (after key share)",
                             last_event_id,
@@ -2118,7 +2146,69 @@ class MatrixAdapter(BasePlatformAdapter):
                 logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
                 return SendResult(success=False, error=str(exc))
 
+        if first_event_id and self._should_add_decision_card_reactions(content, metadata):
+            await self.register_decision_card(
+                room_id=chat_id,
+                message_id=first_event_id,
+                body=content,
+                decision_id=extract_decision_id(content),
+                thread_id=(metadata or {}).get("thread_id"),
+            )
+            for emoji in ("✅", "❌", "🗑️"):
+                try:
+                    await self._send_reaction(chat_id, first_event_id, emoji)
+                except Exception as exc:
+                    logger.debug(
+                        "Matrix: failed to add decision-card reaction %s: %s",
+                        emoji,
+                        exc,
+                    )
+
         return SendResult(success=True, message_id=last_event_id)
+
+    def _should_add_decision_card_reactions(
+        self, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Return true when an outgoing message is an actionable decision card."""
+        if metadata and metadata.get("decision_card_reactions") is True:
+            return True
+        if not content:
+            return False
+        normalized = content.lower()
+        return (
+            "decision moment" in normalized
+            and "✅" in content
+            and "❌" in content
+        )
+
+    async def register_decision_card(
+        self,
+        *,
+        room_id: str,
+        message_id: str,
+        body: str,
+        decision_id: str | None = None,
+        actions: dict[str, str] | None = None,
+        expires_at: str | None = None,
+        session_key: str | None = None,
+        thread_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> DecisionCard:
+        """Register a sent Matrix message as a reaction-addressable decision card."""
+        if expires_at is None:
+            expires_at = default_expiry_iso(self._decision_reaction_expiry_days)
+        return self._decision_card_store.create(
+            platform="matrix",
+            room_id=room_id,
+            message_id=message_id,
+            body=body,
+            decision_id=decision_id,
+            actions=actions,
+            expires_at=expires_at,
+            session_key=session_key,
+            thread_id=thread_id,
+            metadata=metadata,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return room name and type (dm/group)."""
@@ -3333,6 +3423,59 @@ class MatrixAdapter(BasePlatformAdapter):
 
         return body, is_dm, chat_type, thread_id, display_name, source
 
+
+    @staticmethod
+    def _matrix_content_to_text(content: Any) -> str:
+        """Extract a concise plaintext body from Matrix event content."""
+        if hasattr(content, "serialize"):
+            try:
+                content = content.serialize()
+            except Exception:
+                content = None
+        if not isinstance(content, dict):
+            return ""
+        text = str(content.get("body") or "")
+        msgtype = str(content.get("msgtype") or "")
+        if msgtype == "m.text" and text:
+            # Strip Matrix reply fallback if the quoted event also carried a fallback.
+            relates_to = content.get("m.relates_to", {}) or {}
+            if relates_to.get("m.in_reply_to") and text.startswith("> "):
+                lines = text.split("\n")
+                stripped: list[str] = []
+                past_fallback = False
+                for line in lines:
+                    if not past_fallback:
+                        if line.startswith("> ") or line == ">":
+                            continue
+                        if line == "":
+                            past_fallback = True
+                            continue
+                        past_fallback = True
+                    stripped.append(line)
+                text = "\n".join(stripped) if stripped else text
+        return text.strip()
+
+    async def _fetch_reply_to_text(self, room_id: str, reply_to_event_id: Optional[str]) -> Optional[str]:
+        """Fetch the text of the Matrix event this message replies to."""
+        if not reply_to_event_id or not self._client:
+            return None
+        try:
+            response = await self._client.get_event(RoomID(room_id), EventID(reply_to_event_id))
+        except Exception as exc:
+            logger.debug(
+                "Matrix: failed to fetch reply target %s in %s: %s",
+                reply_to_event_id,
+                room_id,
+                exc,
+            )
+            return None
+
+        content = getattr(response, "content", None)
+        if content is None and isinstance(response, dict):
+            content = response.get("content")
+        text = self._matrix_content_to_text(content)
+        return text or None
+
     async def _handle_text_message(
         self,
         room_id: str,
@@ -3360,11 +3503,21 @@ class MatrixAdapter(BasePlatformAdapter):
             return
         body, is_dm, chat_type, thread_id, display_name, source = ctx
 
+        if await self._handle_decision_card_command(
+            room_id=room_id,
+            sender=sender,
+            event_id=event_id,
+            body=body,
+        ):
+            return
+
         # Reply-to detection.
         reply_to = None
+        reply_to_text = None
         in_reply_to = relates_to.get("m.in_reply_to", {})
         if in_reply_to:
             reply_to = in_reply_to.get("event_id")
+            reply_to_text = await self._fetch_reply_to_text(room_id, reply_to)
 
         # Strip reply fallback from body.
         if reply_to and body.startswith("> "):
@@ -3398,12 +3551,52 @@ class MatrixAdapter(BasePlatformAdapter):
             raw_message=source_content,
             message_id=event_id,
             reply_to_message_id=reply_to,
+            reply_to_text=reply_to_text,
         )
 
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(msg_event)
         else:
             await self.handle_message(msg_event)
+
+    async def _handle_decision_card_command(
+        self,
+        *,
+        room_id: str,
+        sender: str,
+        event_id: str,
+        body: str,
+    ) -> bool:
+        """Handle text fallback commands like 'approve D-123'."""
+        if not getattr(self, "_decision_reactions_enabled", False):
+            return False
+        match = _DECISION_COMMAND_RE.match(body or "")
+        if not match:
+            return False
+        action = match.group(1).lower()
+        decision_id = match.group(2)
+        if self._allowed_user_ids and sender not in self._allowed_user_ids:
+            logger.info(
+                "Matrix: ignoring decision command from unauthorized user %s for %s",
+                sender,
+                decision_id,
+            )
+            return True
+        card = self._decision_card_store.get_by_decision_id(decision_id)
+        if card is None:
+            await self.send(room_id, f"Decision {decision_id} was not found.")
+            return True
+        if card.platform != "matrix" or card.room_id != room_id:
+            await self.send(room_id, f"Decision {decision_id} belongs to another room.")
+            return True
+        return await self._dispatch_decision_card_action(
+            card=card,
+            action=action,
+            sender=sender,
+            room_id=room_id,
+            event_id=event_id,
+            original_event_id=card.message_id,
+        )
 
     async def _handle_media_message(
         self,
@@ -3836,6 +4029,124 @@ class MatrixAdapter(BasePlatformAdapter):
             "\u2705" if outcome == ProcessingOutcome.SUCCESS else "\u274c",
         )
 
+    def _build_decision_reaction_text(
+        self,
+        *,
+        card: DecisionCard,
+        action: str,
+        sender: str,
+        room_id: str,
+        reaction_event_id: str,
+        reacts_to: str,
+    ) -> str:
+        return (
+            "Matrix decision reaction received.\n\n"
+            f"Decision ID: {card.decision_id}\n"
+            f"Action: {action}\n"
+            f"Reacting user: {sender}\n"
+            f"Room: {room_id}\n"
+            f"Original event: {reacts_to}\n"
+            f"Reaction event: {reaction_event_id}\n\n"
+            "Decision card:\n"
+            f"{card.body}\n\n"
+            "Apply the approved action. If the target is missing or unsafe, explain the blocker instead of guessing."
+        )
+
+    async def _dispatch_decision_card_action(
+        self,
+        *,
+        card: DecisionCard,
+        action: str,
+        sender: str,
+        room_id: str,
+        event_id: str,
+        original_event_id: str,
+        key: str | None = None,
+    ) -> bool:
+        resolved = self._decision_card_store.resolve(
+            original_event_id, action=action, user_id=sender
+        )
+        if resolved is None:
+            await self.send(
+                room_id,
+                f"Decision {card.decision_id} is expired or unavailable.",
+                reply_to=original_event_id,
+            )
+            return True
+
+        effective_action = resolved.resolved_action or action
+        is_dm = await self._is_dm_room(room_id)
+        display_name = await self._get_display_name(room_id, sender)
+        source = self.build_source(
+            chat_id=room_id,
+            chat_type="dm" if is_dm else "group",
+            user_id=sender,
+            user_name=display_name,
+            thread_id=resolved.thread_id,
+        )
+        msg_event = MessageEvent(
+            text=self._build_decision_reaction_text(
+                card=resolved,
+                action=effective_action,
+                sender=sender,
+                room_id=room_id,
+                reaction_event_id=event_id,
+                reacts_to=original_event_id,
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={
+                "decision_card": resolved.__dict__,
+                "decision_action": effective_action,
+                "reaction": {"event_id": event_id, "key": key, "sender": sender},
+            },
+            message_id=event_id,
+            reply_to_message_id=original_event_id,
+            reply_to_text=resolved.body,
+        )
+        await self.handle_message(msg_event)
+        return True
+
+    async def _handle_decision_card_reaction(
+        self,
+        *,
+        room_id: str,
+        sender: str,
+        reaction_event_id: str,
+        reacts_to: str,
+        key: str,
+    ) -> bool:
+        """Return True if this reaction matched and handled a decision card."""
+        if not getattr(self, "_decision_reactions_enabled", False):
+            return False
+        store = getattr(self, "_decision_card_store", None)
+        if store is None:
+            return False
+        card = store.get_by_message_id(reacts_to)
+        if card is None:
+            return False
+        if card.platform != "matrix" or card.room_id != room_id:
+            return True
+        if self._allowed_user_ids and sender not in self._allowed_user_ids:
+            logger.info(
+                "Matrix: ignoring decision reaction from unauthorized user %s on %s",
+                sender,
+                reacts_to,
+            )
+            return True
+        action = card.actions.get(key)
+        if not action:
+            return True
+        return await self._dispatch_decision_card_action(
+            card=card,
+            action=action,
+            sender=sender,
+            room_id=room_id,
+            event_id=reaction_event_id,
+            original_event_id=reacts_to,
+            key=key,
+        )
+
     async def _on_reaction(self, event: Any) -> None:
         """Handle incoming reaction events."""
         sender = str(getattr(event, "sender", ""))
@@ -3868,6 +4179,15 @@ class MatrixAdapter(BasePlatformAdapter):
                 reacts_to,
                 room_id,
             )
+
+            if await self._handle_decision_card_reaction(
+                room_id=room_id,
+                sender=sender,
+                reaction_event_id=event_id,
+                reacts_to=reacts_to,
+                key=key,
+            ):
+                return
 
             # Check if this reaction resolves a pending approval prompt.
             prompt = self._approval_prompts_by_event.get(reacts_to)

@@ -29,6 +29,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.decision_cards import DecisionCard, DecisionCardStore, default_expiry_iso, extract_decision_id
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -134,7 +135,11 @@ class MattermostAdapter(BasePlatformAdapter):
         self._reconnect_task: Optional[asyncio.Task] = None
         self._closing = False
 
-        # Reply mode: "thread" to nest replies, "off" for flat messages.
+        # Reply mode:
+        # - "off": always post flat channel messages.
+        # - "thread": always set root_id when a reply anchor exists.
+        # - "follow_thread": set root_id only when the incoming Mattermost post was already threaded.
+        # - "smart": legacy alias for "follow_thread".
         self._reply_mode: str = (
             config.extra.get("reply_mode", "")
             or os.getenv("MATTERMOST_REPLY_MODE", "off")
@@ -145,6 +150,23 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
+
+        # Approval prompts keyed by the Mattermost post ID. Reaction events do
+        # not pass through the normal message authorization flow, so the
+        # reaction handler validates MATTERMOST_ALLOWED_USERS before resolving.
+        self._approval_reaction_state: Dict[str, Dict[str, Any]] = {}
+        self._decision_reactions_enabled: bool = config.extra.get(
+            "decision_reactions",
+            os.getenv("MATTERMOST_DECISION_REACTIONS", "true").lower()
+            in {"true", "1", "yes"},
+        )
+        self._decision_reaction_expiry_days: int = int(
+            config.extra.get(
+                "decision_reaction_expiry_days",
+                os.getenv("MATTERMOST_DECISION_REACTION_EXPIRY_DAYS", "14"),
+            )
+        )
+        self._decision_card_store = DecisionCardStore()
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -207,7 +229,12 @@ class MattermostAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """Resolve the Mattermost root_id from reply_to or metadata."""
+        """Resolve the Mattermost root_id for the configured reply mode."""
+        if self._reply_mode == "off":
+            return None
+        if self._reply_mode in {"follow_thread", "smart"}:
+            thread_id = (metadata or {}).get("thread_id")
+            return str(thread_id) if thread_id else None
         if self._reply_mode != "thread":
             return None
         candidate = reply_to
@@ -395,6 +422,7 @@ class MattermostAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
 
+        first_id = None
         last_id = None
         for chunk in chunks:
             payload: Dict[str, Any] = _with_mentions_disabled({
@@ -410,8 +438,77 @@ class MattermostAdapter(BasePlatformAdapter):
             if not data or "id" not in data:
                 return SendResult(success=False, error="Failed to create post")
             last_id = data["id"]
+            if first_id is None:
+                first_id = last_id
+
+        if first_id and self._should_add_decision_card_reactions(content, metadata):
+            await self.register_decision_card(
+                channel_id=chat_id,
+                post_id=str(first_id),
+                body=content,
+                decision_id=extract_decision_id(content),
+                thread_id=(metadata or {}).get("thread_id"),
+            )
+            for emoji_name in ("white_check_mark", "x", "wastebasket"):
+                try:
+                    await self._api_post(
+                        "reactions",
+                        {
+                            "user_id": self._bot_user_id,
+                            "post_id": str(first_id),
+                            "emoji_name": emoji_name,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Mattermost: failed to seed decision reaction %s: %s", emoji_name, exc)
 
         return SendResult(success=True, message_id=last_id)
+
+    def _should_add_decision_card_reactions(
+        self, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Return true when an outgoing message is an actionable decision card."""
+        if not getattr(self, "_decision_reactions_enabled", False):
+            return False
+        if metadata and metadata.get("decision_card_reactions") is True:
+            return True
+        if not content:
+            return False
+        normalized = content.lower()
+        return (
+            "decision moment" in normalized
+            and "✅" in content
+            and "❌" in content
+        )
+
+    async def register_decision_card(
+        self,
+        *,
+        channel_id: str,
+        post_id: str,
+        body: str,
+        decision_id: str | None = None,
+        actions: dict[str, str] | None = None,
+        expires_at: str | None = None,
+        session_key: str | None = None,
+        thread_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> DecisionCard:
+        """Register a sent Mattermost post as a reaction-addressable decision card."""
+        if expires_at is None:
+            expires_at = default_expiry_iso(self._decision_reaction_expiry_days)
+        return self._decision_card_store.create(
+            platform="mattermost",
+            room_id=channel_id,
+            message_id=post_id,
+            body=body,
+            decision_id=decision_id,
+            actions=actions,
+            expires_at=expires_at,
+            session_key=session_key,
+            thread_id=thread_id,
+            metadata=metadata,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return channel name and type."""
@@ -448,6 +545,65 @@ class MattermostAdapter(BasePlatformAdapter):
         if not data or "id" not in data:
             return SendResult(success=False, error="Failed to edit post")
         return SendResult(success=True, message_id=data["id"])
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Send a Mattermost approval prompt that resolves through reactions."""
+        cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
+        if smart_denied:
+            choices = "React with ✅ to allow once or ❌ to deny."
+            reaction_choices = ("white_check_mark", "x")
+            allowed_choices = {"once", "deny"}
+        else:
+            choices = "React with ✅ to allow once or 🟦 to allow for this session"
+            reaction_choices = ("white_check_mark", "blue_square")
+            allowed_choices = {"once", "session", "deny"}
+            if allow_permanent:
+                choices += ", ♾️ to always allow"
+                reaction_choices += ("infinity",)
+                allowed_choices.add("always")
+            choices += ", or ❌ to deny."
+            reaction_choices += ("x",)
+        message = (
+            "⚠️ **Command approval required**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {description}\n\n"
+            f"{choices} Text fallback: `/approve` or `/deny`."
+        )
+        result = await self.send(chat_id, message, metadata=metadata)
+        if not result.success or not result.message_id:
+            return result
+
+        self._approval_reaction_state[str(result.message_id)] = {
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "allowed_choices": allowed_choices,
+        }
+
+        # Seed the post with the available choices. If the bot lacks reaction
+        # permission, the text instructions still let desktop clients approve.
+        for emoji_name in reaction_choices:
+            try:
+                await self._api_post(
+                    "reactions",
+                    {
+                        "user_id": self._bot_user_id,
+                        "post_id": str(result.message_id),
+                        "emoji_name": emoji_name,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Mattermost: failed to seed approval reaction %s: %s", emoji_name, exc)
+
+        return result
 
     async def send_image(
         self,
@@ -808,9 +964,204 @@ class MattermostAdapter(BasePlatformAdapter):
                 logger.info("Mattermost: WebSocket closed (%s)", raw_msg.type)
                 break
 
+    async def _handle_reaction_added(self, event: Dict[str, Any]) -> None:
+        """Resolve approval prompts from Mattermost reaction events."""
+        data = event.get("data", {}) or {}
+        raw_reaction = data.get("reaction")
+        if not raw_reaction:
+            return
+        try:
+            reaction = json.loads(raw_reaction) if isinstance(raw_reaction, str) else raw_reaction
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(reaction, dict):
+            return
+
+        post_id = str(reaction.get("post_id") or "")
+        state = self._approval_reaction_state.get(post_id)
+        if not state:
+            await self._handle_decision_card_reaction(reaction)
+            return
+
+        user_id = str(reaction.get("user_id") or "")
+        if not user_id or user_id == self._bot_user_id:
+            return
+
+        allowed_csv = os.getenv("MATTERMOST_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "Mattermost: unauthorized approval reaction by %s on %s — ignoring",
+                    user_id,
+                    post_id,
+                )
+                return
+
+        emoji_name = str(reaction.get("emoji_name") or "").strip().lower()
+        choice_map = {
+            "white_check_mark": "once",
+            "heavy_check_mark": "once",
+            "check": "once",
+            "blue_square": "session",
+            "large_blue_square": "session",
+            "infinity": "always",
+            "x": "deny",
+            "negative_squared_cross_mark": "deny",
+            "no_entry_sign": "deny",
+        }
+        choice = choice_map.get(emoji_name)
+        if not choice:
+            return
+        if choice not in state.get("allowed_choices", {"once", "session", "always", "deny"}):
+            return
+
+        state = self._approval_reaction_state.pop(post_id, None)
+        if not state:
+            return
+
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(state["session_key"], choice)
+            logger.info(
+                "Mattermost reaction resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                count,
+                state["session_key"],
+                choice,
+                user_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Mattermost: failed to resolve approval reaction: %s", exc, exc_info=True)
+            return
+
+        label_map = {
+            "once": f"✅ Approved once by {user_id}",
+            "session": f"✅ Approved for session by {user_id}",
+            "always": f"✅ Approved permanently by {user_id}",
+            "deny": f"❌ Denied by {user_id}",
+        }
+        await self.send(
+            state["chat_id"],
+            label_map.get(choice, f"Resolved by {user_id}"),
+            metadata={"thread_id": post_id},
+        )
+
+    def _mattermost_decision_action_for_emoji(self, emoji_name: str) -> str | None:
+        emoji = (emoji_name or "").strip().lower()
+        return {
+            "white_check_mark": "approve",
+            "heavy_check_mark": "approve",
+            "check": "approve",
+            "x": "deny",
+            "negative_squared_cross_mark": "deny",
+            "no_entry_sign": "deny",
+            "wastebasket": "close",
+            "put_litter_in_its_place": "close",
+        }.get(emoji)
+
+    def _is_authorized_reaction_user(self, user_id: str) -> bool:
+        if not user_id or user_id == self._bot_user_id:
+            return False
+        allowed_csv = os.getenv("MATTERMOST_ALLOWED_USERS", "").strip()
+        if not allowed_csv:
+            return True
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        return "*" in allowed_ids or user_id in allowed_ids
+
+    def _build_decision_reaction_text(
+        self,
+        *,
+        card: DecisionCard,
+        action: str,
+        sender: str,
+        post_id: str,
+    ) -> str:
+        return (
+            "Mattermost decision reaction received.\n\n"
+            f"Decision ID: {card.decision_id}\n"
+            f"Action: {action}\n"
+            f"Reacting user: {sender}\n"
+            f"Channel: {card.room_id}\n"
+            f"Original post: {post_id}\n\n"
+            "Decision card:\n"
+            f"{card.body}\n\n"
+            "Apply the approved action. If the target is missing or unsafe, explain the blocker instead of guessing."
+        )
+
+    async def _handle_decision_card_reaction(self, reaction: Dict[str, Any]) -> bool:
+        """Dispatch a synthetic message for a registered Mattermost decision-card reaction."""
+        if not getattr(self, "_decision_reactions_enabled", False):
+            return False
+        post_id = str(reaction.get("post_id") or "")
+        if not post_id:
+            return False
+        store = getattr(self, "_decision_card_store", None)
+        if store is None:
+            return False
+        card = store.get_by_message_id(post_id)
+        if card is None:
+            return False
+        if card.platform != "mattermost":
+            return True
+
+        user_id = str(reaction.get("user_id") or "")
+        if not self._is_authorized_reaction_user(user_id):
+            logger.info(
+                "Mattermost: ignoring decision reaction from unauthorized user %s on %s",
+                user_id,
+                post_id,
+            )
+            return True
+
+        base_action = self._mattermost_decision_action_for_emoji(
+            str(reaction.get("emoji_name") or "")
+        )
+        if not base_action:
+            return True
+        action = card.actions.get({"approve": "✅", "deny": "❌", "close": "🗑️"}.get(base_action, ""), base_action)
+        resolved = store.resolve(post_id, action=action, user_id=user_id)
+        if resolved is None:
+            await self.send(
+                card.room_id,
+                f"Decision {card.decision_id} is expired or unavailable.",
+                metadata={"thread_id": post_id},
+            )
+            return True
+
+        source = self.build_source(
+            chat_id=resolved.room_id,
+            chat_type="group",
+            user_id=user_id,
+            user_name=user_id,
+            thread_id=resolved.thread_id,
+        )
+        msg_event = MessageEvent(
+            text=self._build_decision_reaction_text(
+                card=resolved,
+                action=resolved.resolved_action or action,
+                sender=user_id,
+                post_id=post_id,
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={
+                "decision_card": resolved.__dict__,
+                "decision_action": resolved.resolved_action or action,
+                "reaction": reaction,
+            },
+            message_id=str(reaction.get("create_at") or post_id),
+            reply_to_message_id=post_id,
+            reply_to_text=resolved.body,
+        )
+        await self.handle_message(msg_event)
+        return True
+
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         """Process a single WebSocket event."""
         event_type = event.get("event")
+        if event_type == "reaction_added":
+            await self._handle_reaction_added(event)
+            return
         if event_type != "posted":
             return
 
@@ -908,7 +1259,23 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Thread support: if the post is in a thread, use root_id. In
         # thread mode, top-level channel posts are valid roots for progress.
-        thread_id = post.get("root_id") or None
+        reply_to_message_id = post.get("root_id") or None
+        reply_to_text = None
+        reply_to_author_id = None
+        reply_to_is_own_message = False
+        if reply_to_message_id:
+            # Mattermost thread replies identify the root post but do not carry
+            # its text in the WebSocket event. Fetch it so the shared gateway
+            # reply-context path can tell the model what the user replied to.
+            root_post = await self._api_get(f"posts/{reply_to_message_id}")
+            if root_post:
+                reply_to_text = root_post.get("message") or None
+                reply_to_author_id = root_post.get("user_id") or None
+                reply_to_is_own_message = bool(
+                    reply_to_author_id and reply_to_author_id == self._bot_user_id
+                )
+
+        thread_id = reply_to_message_id
         if (
             not thread_id
             and self._reply_mode == "thread"
@@ -994,6 +1361,10 @@ class MattermostAdapter(BasePlatformAdapter):
             source=source,
             raw_message=post,
             message_id=post_id,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id,
+            reply_to_is_own_message=reply_to_is_own_message,
             media_urls=media_urls if media_urls else None,
             media_types=media_types if media_types else None,
             channel_prompt=_channel_prompt,
@@ -1241,6 +1612,10 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
+    if "decision_reactions" in mattermost_cfg and not os.getenv("MATTERMOST_DECISION_REACTIONS"):
+        os.environ["MATTERMOST_DECISION_REACTIONS"] = str(mattermost_cfg["decision_reactions"]).lower()
+    if "decision_reaction_expiry_days" in mattermost_cfg and not os.getenv("MATTERMOST_DECISION_REACTION_EXPIRY_DAYS"):
+        os.environ["MATTERMOST_DECISION_REACTION_EXPIRY_DAYS"] = str(mattermost_cfg["decision_reaction_expiry_days"])
     frc = mattermost_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):
