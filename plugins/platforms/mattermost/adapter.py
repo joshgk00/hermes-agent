@@ -554,6 +554,7 @@ class MattermostAdapter(BasePlatformAdapter):
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
         """Send a Mattermost approval prompt that resolves through reactions."""
@@ -563,13 +564,17 @@ class MattermostAdapter(BasePlatformAdapter):
             reaction_choices = ("white_check_mark", "x")
             allowed_choices = {"once", "deny"}
         else:
-            choices = "React with ✅ to allow once or 🟦 to allow for this session"
-            reaction_choices = ("white_check_mark", "blue_square")
-            allowed_choices = {"once", "session", "deny"}
-            if allow_permanent:
-                choices += ", ♾️ to always allow"
-                reaction_choices += ("infinity",)
-                allowed_choices.add("always")
+            choices = "React with ✅ to allow once"
+            reaction_choices = ("white_check_mark",)
+            allowed_choices = {"once", "deny"}
+            if allow_session:
+                choices += " or 🟦 to allow for this session"
+                reaction_choices += ("blue_square",)
+                allowed_choices.add("session")
+                if allow_permanent:
+                    choices += ", ♾️ to always allow"
+                    reaction_choices += ("infinity",)
+                    allowed_choices.add("always")
             choices += ", or ❌ to deny."
             reaction_choices += ("x",)
         message = (

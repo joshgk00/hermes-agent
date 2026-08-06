@@ -326,6 +326,35 @@ class TestMattermostSend:
             "x",
         ]
 
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_honors_disabled_session_scope(self):
+        """Disabled session scope must expose only one-operation approval and denial."""
+        calls = []
+
+        async def fake_api_post(path, payload):
+            calls.append((path, payload))
+            if path == "posts":
+                return {"id": "once_only_approval_post"}
+            return {"ok": True}
+
+        self.adapter._bot_user_id = "bot_user"
+        self.adapter._api_post = fake_api_post
+
+        result = await self.adapter.send_exec_approval(
+            "channel_1",
+            "run once-only operation",
+            "session_1",
+            allow_session=False,
+        )
+
+        assert result.success is True
+        assert "🟦" not in calls[0][1]["message"]
+        assert self.adapter._approval_reaction_state["once_only_approval_post"]["allowed_choices"] == {"once", "deny"}
+        assert [payload["emoji_name"] for path, payload in calls[1:] if path == "reactions"] == [
+            "white_check_mark",
+            "x",
+        ]
+
 # ---------------------------------------------------------------------------
 # WebSocket event parsing
 # ---------------------------------------------------------------------------
