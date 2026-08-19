@@ -273,6 +273,29 @@ class TestBlueBubblesAttachmentDownload:
         )
         assert result == "/tmp/test_image.png"
 
+    @pytest.mark.asyncio
+    async def test_download_failure_log_does_not_expose_authenticated_url(
+        self, monkeypatch, caplog
+    ):
+        adapter = _make_adapter(monkeypatch)
+
+        async def failing_get(*args, **kwargs):
+            raise RuntimeError(
+                "http://localhost:1234/api/v1/attachment/+15555550100/download"
+                "?password=secret PRIVATE MESSAGE BODY"
+            )
+
+        adapter.client = type("MockClient", (), {"get": failing_get})()
+        with caplog.at_level("WARNING", logger="gateway.platforms.bluebubbles"):
+            result = await adapter._download_attachment(
+                "+15555550100", {"mimeType": "image/png"}
+            )
+
+        assert result is None
+        assert "password=secret" not in caplog.text
+        assert "+15555550100" not in caplog.text
+        assert "PRIVATE MESSAGE BODY" not in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Webhook registration
@@ -438,3 +461,287 @@ class TestBlueBubblesWebhookRegistration:
         assert len(deleted_ids) == 2
 
 
+def _poll_record(rowid, guid, *, text="hello", from_me=False, **overrides):
+    record = {
+        "originalROWID": rowid,
+        "guid": guid,
+        "text": text,
+        "isFromMe": from_me,
+        "handle": {"address": "+15555550100"},
+        "chats": [{"guid": "iMessage;-;+15555550100"}],
+        "attachments": [],
+    }
+    record.update(overrides)
+    return record
+
+
+class TestBlueBubblesPollingFallback:
+    @staticmethod
+    def _use_profile_home(monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    @staticmethod
+    def _capture_messages(monkeypatch, adapter):
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        return handled
+
+    @pytest.mark.asyncio
+    async def test_first_start_seeds_newest_without_replaying_history(
+        self, monkeypatch, tmp_path
+    ):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch)
+        handled = self._capture_messages(monkeypatch, adapter)
+        records = [_poll_record(2, "newest"), _poll_record(1, "older")]
+
+        async def query(_offset):
+            return records
+
+        monkeypatch.setattr(adapter, "_query_message_page", query)
+        await adapter._poll_messages_once()
+        await asyncio.sleep(0)
+
+        assert handled == []
+        state = json.loads(adapter._poll_state_path.read_text(encoding="utf-8"))
+        assert state == {"rowid": 2, "guid": "newest"}
+
+    @pytest.mark.asyncio
+    async def test_query_uses_bluebubbles_relation_names(self, monkeypatch, tmp_path):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch)
+        calls = []
+
+        async def api_post(path, payload):
+            calls.append((path, payload))
+            return {"data": []}
+
+        monkeypatch.setattr(adapter, "_api_post", api_post)
+        assert await adapter._query_message_page(100) == []
+        assert calls == [
+            (
+                "/api/v1/message/query",
+                {
+                    "limit": 100,
+                    "offset": 100,
+                    "sort": "DESC",
+                    "with": ["chat", "attachment", "handle"],
+                },
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_first_start_does_not_drop_first_later_message(
+        self, monkeypatch, tmp_path
+    ):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch)
+        handled = self._capture_messages(monkeypatch, adapter)
+        pages = [[], [_poll_record(1, "first-new-message")]]
+
+        async def query(_offset):
+            return pages.pop(0)
+
+        monkeypatch.setattr(adapter, "_query_message_page", query)
+        await adapter._poll_messages_once()
+        await adapter._poll_messages_once()
+        await asyncio.sleep(0)
+
+        assert [event.message_id for event in handled] == ["first-new-message"]
+        state = json.loads(adapter._poll_state_path.read_text(encoding="utf-8"))
+        assert state == {"rowid": 1, "guid": "first-new-message"}
+
+    @pytest.mark.asyncio
+    async def test_detects_new_inbound_message(self, monkeypatch, tmp_path):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch)
+        handled = self._capture_messages(monkeypatch, adapter)
+        adapter._persist_poll_mark(_poll_record(1, "old"))
+
+        async def query(_offset):
+            return [_poll_record(2, "new", text="new inbound"), _poll_record(1, "old")]
+
+        monkeypatch.setattr(adapter, "_query_message_page", query)
+        await adapter._poll_messages_once()
+        await asyncio.sleep(0)
+
+        assert [event.message_id for event in handled] == ["new"]
+        assert handled[0].text == "new inbound"
+
+    @pytest.mark.asyncio
+    async def test_restart_uses_persisted_mark_and_catches_up(
+        self, monkeypatch, tmp_path
+    ):
+        self._use_profile_home(monkeypatch, tmp_path)
+        first = _make_adapter(monkeypatch)
+
+        async def seed_query(_offset):
+            return [_poll_record(5, "before-restart")]
+
+        monkeypatch.setattr(first, "_query_message_page", seed_query)
+        await first._poll_messages_once()
+
+        restarted = _make_adapter(monkeypatch)
+        handled = self._capture_messages(monkeypatch, restarted)
+
+        async def catch_up_query(_offset):
+            return [
+                _poll_record(7, "during-downtime-2"),
+                _poll_record(6, "during-downtime-1"),
+                _poll_record(5, "before-restart"),
+            ]
+
+        monkeypatch.setattr(restarted, "_query_message_page", catch_up_query)
+        await restarted._poll_messages_once()
+        await asyncio.sleep(0)
+
+        assert [event.message_id for event in handled] == [
+            "during-downtime-1",
+            "during-downtime-2",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_webhook_and_poll_share_dedupe(self, monkeypatch, tmp_path):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = self._capture_messages(monkeypatch, adapter)
+        old = _poll_record(1, "old")
+        duplicate = _poll_record(2, "same-guid")
+        adapter._persist_poll_mark(old)
+
+        assert await adapter._process_inbound_payload(
+            {"type": "new-message", "data": duplicate}
+        ) == "accepted"
+
+        async def query(_offset):
+            return [duplicate, old]
+
+        monkeypatch.setattr(adapter, "_query_message_page", query)
+        await adapter._poll_messages_once()
+        await asyncio.sleep(0)
+
+        assert [event.message_id for event in handled] == ["same-guid"]
+
+    @pytest.mark.asyncio
+    async def test_webhook_and_poll_dedupe_across_guid_rowid_aliases(
+        self, monkeypatch, tmp_path
+    ):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = self._capture_messages(monkeypatch, adapter)
+        old = _poll_record(1, "old")
+        adapter._persist_poll_mark(old)
+
+        webhook_record = _poll_record(2, "same-message")
+        webhook_record.pop("originalROWID")
+        assert await adapter._process_inbound_payload(
+            {"type": "new-message", "data": webhook_record}
+        ) == "accepted"
+
+        polled_record = _poll_record(2, "same-message")
+
+        async def query(_offset):
+            return [polled_record, old]
+
+        monkeypatch.setattr(adapter, "_query_message_page", query)
+        await adapter._poll_messages_once()
+        rowid_only = dict(polled_record, guid=None)
+        assert await adapter._process_inbound_payload(
+            {"type": "new-message", "data": rowid_only}
+        ) == "ignored"
+        await asyncio.sleep(0)
+
+        assert [event.message_id for event in handled] == ["same-message"]
+
+    @pytest.mark.asyncio
+    async def test_transient_query_failure_recovers_without_message_leak_in_log(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch, poll_interval_seconds=0.001)
+        handled = self._capture_messages(monkeypatch, adapter)
+        old = _poll_record(1, "old")
+        new = _poll_record(2, "new", text="PRIVATE MESSAGE BODY")
+        adapter._persist_poll_mark(old)
+        calls = 0
+
+        async def flaky_query(_offset):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("secret +15555550100 PRIVATE MESSAGE BODY")
+            return [new, old]
+
+        monkeypatch.setattr(adapter, "_query_message_page", flaky_query)
+        with caplog.at_level("WARNING", logger="gateway.platforms.bluebubbles"):
+            task = asyncio.create_task(adapter._poll_messages_loop())
+            for _ in range(100):
+                if handled:
+                    break
+                await asyncio.sleep(0.001)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert [event.message_id for event in handled] == ["new"]
+        assert "PRIVATE MESSAGE BODY" not in caplog.text
+        assert "+15555550100" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_poll_task_cancels_cleanly(self, monkeypatch, tmp_path):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch, poll_interval_seconds=60)
+        entered_query = asyncio.Event()
+
+        async def blocked_query(_offset):
+            entered_query.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(adapter, "_query_message_page", blocked_query)
+        task = asyncio.create_task(adapter._poll_messages_loop())
+        adapter._poll_task = task
+        await entered_query.wait()
+        await asyncio.wait_for(adapter.disconnect(), timeout=0.1)
+
+        assert task.done()
+        assert task.cancelled()
+        assert adapter._poll_task is None
+
+    @pytest.mark.asyncio
+    async def test_ignored_outbound_and_system_records_advance_checkpoint(
+        self, monkeypatch, tmp_path
+    ):
+        self._use_profile_home(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch)
+        handled = self._capture_messages(monkeypatch, adapter)
+        old = _poll_record(1, "old")
+        adapter._persist_poll_mark(old)
+
+        async def query(_offset):
+            return [
+                _poll_record(3, "system", isSystemMessage=True),
+                _poll_record(2, "outbound", from_me=True),
+                old,
+            ]
+
+        monkeypatch.setattr(adapter, "_query_message_page", query)
+        await adapter._poll_messages_once()
+        await asyncio.sleep(0)
+
+        assert handled == []
+        state = json.loads(adapter._poll_state_path.read_text(encoding="utf-8"))
+        assert state["rowid"] == 3
+
+    def test_polling_can_be_disabled_in_config(self, monkeypatch, tmp_path):
+        self._use_profile_home(monkeypatch, tmp_path)
+        assert (
+            _make_adapter(monkeypatch, poll_interval_seconds=0).poll_interval_seconds
+            == 0
+        )
+        assert (
+            _make_adapter(monkeypatch, poll_enabled=False).poll_interval_seconds
+            == 0
+        )
