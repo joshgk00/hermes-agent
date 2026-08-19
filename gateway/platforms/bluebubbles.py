@@ -31,8 +31,11 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
 )
-from .media_cache import ext_for_mime
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
+from hermes_constants import get_hermes_home
+from utils import atomic_json_write
+
+from .media_cache import ext_for_mime
 
 # Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for
 # the shared dispatch in gateway.platforms.media_cache. Both maps are
@@ -122,6 +125,11 @@ _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
+_MESSAGE_DEDUPE_SIZE = 1000
+_POLL_DEFAULT_INTERVAL_SECONDS = 5.0
+_POLL_QUERY_LIMIT = 100
+_POLL_MAX_PAGES = 10
+_POLL_STATE_FILENAME = "bluebubbles_poll.json"
 
 
 def _redact(text: str) -> str:
@@ -202,6 +210,29 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        raw_poll_interval = extra.get(
+            "poll_interval_seconds",
+            extra.get("poll_interval", _POLL_DEFAULT_INTERVAL_SECONDS),
+        )
+        if extra.get("poll_enabled") is False:
+            raw_poll_interval = 0
+        try:
+            self.poll_interval_seconds = max(0.0, float(raw_poll_interval))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[bluebubbles] invalid polling interval; using %.1f seconds",
+                _POLL_DEFAULT_INTERVAL_SECONDS,
+            )
+            self.poll_interval_seconds = _POLL_DEFAULT_INTERVAL_SECONDS
+        # Capture the active profile home while the adapter is constructed.
+        # A multiplexed gateway may later run other tasks under another
+        # context-local profile override.
+        self._poll_state_path = (
+            get_hermes_home() / "state" / _POLL_STATE_FILENAME
+        )
+        self._poll_task: Optional[asyncio.Task] = None
+        self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
+        self._inflight_message_ids: Dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------
     # API helpers
@@ -319,9 +350,20 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         # This is required for the server to know where to send events
         await self._register_webhook()
 
+        if self.poll_interval_seconds > 0:
+            self._poll_task = asyncio.create_task(
+                self._poll_messages_loop(), name="bluebubbles-message-poll"
+            )
+
         return True
 
     async def disconnect(self) -> None:
+        poll_task = self._poll_task
+        self._poll_task = None
+        if poll_task:
+            poll_task.cancel()
+            await asyncio.gather(poll_task, return_exceptions=True)
+
         # Unregister webhook before cleaning up
         await self._unregister_webhook()
 
@@ -332,6 +374,238 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             await self._runner.cleanup()
             self._runner = None
         self._mark_disconnected()
+
+    # ------------------------------------------------------------------
+    # Inbound polling fallback
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _record_rowid(record: Dict[str, Any]) -> Optional[int]:
+        # BlueBubbles' serializer exposes the Messages database ROWID as
+        # ``originalROWID``. Keep the other spellings for webhook/version
+        # compatibility and for installations using an API-compatible server.
+        for key in ("originalROWID", "ROWID", "rowid", "id"):
+            value = record.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _record_dedupe_keys(self, record: Dict[str, Any]) -> set[str]:
+        keys: set[str] = set()
+        guid = self._value(record.get("guid"), record.get("messageGuid"))
+        if guid:
+            keys.add(f"guid:{guid}")
+        rowid = self._record_rowid(record)
+        if rowid is not None:
+            keys.add(f"rowid:{rowid}")
+        return keys
+
+    def _remember_message_keys(self, keys: set[str]) -> None:
+        for key in keys:
+            self._seen_message_ids[key] = None
+            self._seen_message_ids.move_to_end(key)
+        while len(self._seen_message_ids) > _MESSAGE_DEDUPE_SIZE:
+            self._seen_message_ids.popitem(last=False)
+
+    def _claim_message(
+        self, record: Dict[str, Any]
+    ) -> tuple[Optional[set[str]], bool]:
+        keys = self._record_dedupe_keys(record)
+        seen = keys.intersection(self._seen_message_ids)
+        if seen:
+            # Learn every alias supplied by this copy. This matters when a
+            # webhook contains only a GUID but the query record later adds a
+            # ROWID (or vice versa).
+            self._remember_message_keys(keys)
+            return None, False
+
+        inflight_claim = next(
+            (
+                self._inflight_message_ids[key]
+                for key in keys
+                if key in self._inflight_message_ids
+            ),
+            None,
+        )
+        if inflight_claim is not None:
+            # Share the mutable claim so the original processor remembers any
+            # GUID/ROWID alias discovered by the racing delivery.
+            inflight_claim.update(keys)
+            for key in keys:
+                self._inflight_message_ids[key] = inflight_claim
+            return None, False
+
+        if not keys:
+            return None, True
+        claim = set(keys)
+        for key in claim:
+            self._inflight_message_ids[key] = claim
+        return claim, True
+
+    def _finish_message_claim(
+        self, claim: Optional[set[str]], *, remember: bool
+    ) -> None:
+        if claim is None:
+            return
+        for key in claim:
+            if self._inflight_message_ids.get(key) is claim:
+                self._inflight_message_ids.pop(key, None)
+        if remember:
+            self._remember_message_keys(claim)
+
+    def _load_poll_mark(self) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.loads(self._poll_state_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
+            rowid = data.get("rowid")
+            guid = data.get("guid")
+            if rowid is not None:
+                rowid = int(rowid)
+            if rowid is None and not isinstance(guid, str):
+                return None
+            return {"rowid": rowid, "guid": guid if isinstance(guid, str) else None}
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _persist_poll_mark(self, record: Dict[str, Any]) -> bool:
+        rowid = self._record_rowid(record)
+        guid = self._value(record.get("guid"), record.get("messageGuid"))
+        if rowid is None and not guid:
+            return False
+        return self._persist_poll_mark_values(rowid=rowid, guid=guid)
+
+    def _persist_poll_mark_values(
+        self, *, rowid: Optional[int], guid: Optional[str]
+    ) -> bool:
+        try:
+            atomic_json_write(
+                self._poll_state_path,
+                {"rowid": rowid, "guid": guid},
+                indent=None,
+                separators=(",", ":"),
+            )
+            return True
+        except OSError as exc:
+            logger.warning(
+                "[bluebubbles] could not persist polling checkpoint (%s)",
+                type(exc).__name__,
+            )
+            return False
+
+    @staticmethod
+    def _record_at_or_before_mark(
+        record: Dict[str, Any], mark: Dict[str, Any]
+    ) -> bool:
+        rowid = BlueBubblesAdapter._record_rowid(record)
+        mark_rowid = mark.get("rowid")
+        if rowid is not None and mark_rowid is not None:
+            return rowid <= mark_rowid
+        guid = record.get("guid") or record.get("messageGuid")
+        return bool(guid and mark.get("guid") and guid == mark["guid"])
+
+    async def _query_message_page(self, offset: int) -> List[Dict[str, Any]]:
+        response = await self._api_post(
+            "/api/v1/message/query",
+            {
+                "limit": _POLL_QUERY_LIMIT,
+                "offset": offset,
+                "sort": "DESC",
+                # These are TypeORM relation names accepted by BlueBubbles'
+                # query API. The serialized response fields are plural
+                # (``chats``/``attachments``), but the requested relations are
+                # singular.
+                "with": ["chat", "attachment", "handle"],
+            },
+        )
+        records = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(records, list):
+            raise ValueError("message query response did not contain a record list")
+        if any(not isinstance(record, dict) for record in records):
+            raise ValueError("message query response contained an invalid record")
+        return records
+
+    async def _poll_messages_once(self) -> None:
+        mark = self._load_poll_mark()
+        first_page = await self._query_message_page(0)
+        if not first_page:
+            if mark is None:
+                # Record an explicit empty baseline. Otherwise the first
+                # message arriving after an empty first install would be
+                # mistaken for pre-existing history and silently skipped.
+                self._persist_poll_mark_values(rowid=0, guid=None)
+            return
+
+        newest_record = first_page[0]
+        if mark is None:
+            # A missing or unreadable checkpoint is treated as a first install:
+            # seed from the newest current record and never replay history.
+            self._persist_poll_mark(newest_record)
+            return
+
+        new_records: List[Dict[str, Any]] = []
+        page = first_page
+        complete = False
+        for page_number in range(_POLL_MAX_PAGES):
+            for record in page:
+                if self._record_at_or_before_mark(record, mark):
+                    complete = True
+                    break
+                new_records.append(record)
+            if complete or len(page) < _POLL_QUERY_LIMIT:
+                complete = True
+                break
+            if page_number + 1 >= _POLL_MAX_PAGES:
+                break
+            page = await self._query_message_page((page_number + 1) * _POLL_QUERY_LIMIT)
+
+        if not complete:
+            logger.warning(
+                "[bluebubbles] polling catch-up exceeded the bounded query window; checkpoint unchanged"
+            )
+            return
+
+        # Query results are newest-first. Dispatch oldest-first so messages in
+        # the same chat retain their original ordering.
+        for record in reversed(new_records):
+            try:
+                await self._process_inbound_payload(
+                    {"type": "new-message", "data": record}
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Treat a malformed/poison record as intentionally ignored.
+                # Logging only the exception class avoids leaking message data.
+                logger.warning(
+                    "[bluebubbles] ignored polling record after processing error (%s)",
+                    type(exc).__name__,
+                )
+            # The full query window was fetched successfully before dispatch
+            # began, so it is safe to advance one record at a time. This keeps
+            # accepted and intentionally ignored records from replaying if
+            # cancellation lands partway through the oldest-first batch.
+            self._persist_poll_mark(record)
+
+    async def _poll_messages_loop(self) -> None:
+        while True:
+            try:
+                await self._poll_messages_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # httpx exceptions can include the authenticated query URL, so
+                # never interpolate the exception text here.
+                logger.warning(
+                    "[bluebubbles] message query failed (%s); will retry",
+                    type(exc).__name__,
+                )
+            await asyncio.sleep(self.poll_interval_seconds)
 
     @property
     def _webhook_url(self) -> str:
@@ -861,10 +1135,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return cache_document_from_bytes(data, filename)
 
         except Exception as exc:
+            # httpx exceptions may include the authenticated download URL.
+            # Polling reaches this same helper, so never interpolate the URL,
+            # attachment GUID, credentials, or message-related values here.
             logger.warning(
-                "[bluebubbles] failed to download attachment %s: %s",
-                _redact(att_guid),
-                exc,
+                "[bluebubbles] failed to download attachment (%s)",
+                type(exc).__name__,
             )
             return None
 
@@ -930,22 +1206,66 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if event_type and event_type not in _MESSAGE_EVENTS:
             return web.Response(text="ok")
 
+        result = await self._process_inbound_payload(payload)
+        if result == "invalid":
+            return web.json_response({"error": "missing message fields"}, status=400)
+        return web.Response(text="ok")
+
+    async def _process_inbound_payload(self, payload: Dict[str, Any]) -> str:
+        """Normalize and dispatch one webhook or polled message payload.
+
+        Returns ``accepted``, ``ignored``, or ``invalid``. Both inbound sources
+        use this method so authorization and session dispatch remain on the
+        established :class:`MessageEvent` path.
+        """
         record = self._extract_payload_record(payload) or {}
+        claim, claimed = self._claim_message(record)
+        if not claimed:
+            return "ignored"
+        remember_claim = False
+        try:
+            result = await self._normalize_and_dispatch_record(payload, record)
+            # Accepted and intentionally ignored records must not reappear on
+            # the other inbound path. Invalid records remain retryable because
+            # an attachment download may have failed transiently.
+            remember_claim = result != "invalid"
+            return result
+        finally:
+            self._finish_message_claim(claim, remember=remember_claim)
+
+    async def _normalize_and_dispatch_record(
+        self, payload: Dict[str, Any], record: Dict[str, Any]
+    ) -> str:
         is_from_me = bool(
             record.get("isFromMe")
             or record.get("fromMe")
             or record.get("is_from_me")
         )
         if is_from_me:
-            return web.Response(text="ok")
+            return "ignored"
 
-        # Skip tapback reactions delivered as messages
+        # Skip tapbacks and system records delivered as messages.
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, int) and assoc_type in {
             **_TAPBACK_ADDED,
             **_TAPBACK_REMOVED,
         }:
-            return web.Response(text="ok")
+            return "ignored"
+        item_type = record.get("itemType", record.get("item_type", 0))
+        group_action_type = record.get(
+            "groupActionType", record.get("group_action_type", 0)
+        )
+        if (
+            bool(
+                record.get("isSystemMessage")
+                or record.get("is_system_message")
+                or record.get("isServiceMessage")
+                or record.get("is_service_message")
+            )
+            or item_type not in (None, 0, "0")
+            or group_action_type not in (None, 0, "0")
+        ):
+            return "ignored"
 
         text = (
             self._value(
@@ -956,11 +1276,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         # --- Inbound attachment handling ---
         attachments = record.get("attachments") or []
+        if not isinstance(attachments, list):
+            attachments = []
         media_urls: List[str] = []
         media_types: List[str] = []
         msg_type = MessageType.TEXT
 
         for att in attachments:
+            if not isinstance(att, dict):
+                continue
             att_guid = att.get("guid", "")
             if not att_guid:
                 continue
@@ -1024,7 +1348,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not (chat_guid or chat_identifier) and sender:
             chat_identifier = sender
         if not sender or not (chat_guid or chat_identifier) or not text:
-            return web.json_response({"error": "missing message fields"}, status=400)
+            return "invalid"
 
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
@@ -1033,7 +1357,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 logger.debug(
                     "[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)"
                 )
-                return web.Response(text="ok")
+                return "ignored"
             text = self._clean_mention_text(text)
         source = self.build_source(
             chat_id=session_chat_id,
@@ -1068,4 +1392,4 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if self.send_read_receipts and session_chat_id:
             asyncio.create_task(self.mark_read(session_chat_id))
 
-        return web.Response(text="ok")
+        return "accepted"
