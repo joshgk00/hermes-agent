@@ -330,6 +330,12 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            # Remote/backend reads cross the same boundary as local reads.
+            # A NUL-bearing result is binary content, not script text;
+            # recursively tokenizing it manufactures invalid path candidates
+            # and can raise ``ValueError: embedded null byte`` in ``os.open``.
+            if script_text and "\x00" in script_text:
+                continue
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's

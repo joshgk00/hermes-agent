@@ -540,6 +540,49 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    def test_cli_argument_binary_file_not_scanned_as_script(
+        self, monkeypatch, tmp_path
+    ):
+        """A remote binary CLI is skipped; its SQLite argument stays data."""
+        import tools.terminal_tool as tt
+
+        cli_path = "/workspace/open-loop-index"
+        database = tmp_path / "state.db"
+        database.write_bytes(
+            b"SQLite format 3\x00\n/opt/bin/tool\x00 --run\n"
+        )
+        database_path = str(database)
+        command = f"{cli_path} query --database {database_path}"
+        reads = []
+
+        class _FakeRemoteEnv:
+            env = {}
+            cwd = "/workspace"
+
+            def execute(self, invoked, **kwargs):
+                if invoked.startswith("cat "):
+                    reads.append(invoked)
+                    if invoked == f"cat {cli_path}":
+                        return {
+                            "output": "/opt/open-loop-index\x00binary payload\n",
+                            "returncode": 0,
+                        }
+                    if invoked == f"cat {database_path}":
+                        raise AssertionError("database argument must not be read")
+                    return {"output": "", "returncode": 1}
+                assert invoked == command
+                return {"output": "query complete", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeRemoteEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert reads == [f"cat {cli_path}"]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
