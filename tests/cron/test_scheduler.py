@@ -1885,6 +1885,53 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert "b@example.com" in result
         assert mock_pool.submit.call_count == 2
 
+    def test_fallback_submit_failure_does_not_leak_send_coroutine(self):
+        """A rejected pool submission must not leave an unawaited send."""
+        job = {
+            "id": "submit-fail-job",
+            "deliver": "email:a@example.com",
+        }
+
+        class PendingSend:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        pending_sends = []
+
+        def make_pending_send(*args, **kwargs):
+            pending = PendingSend()
+            pending_sends.append(pending)
+            return pending
+
+        with patch(
+            "gateway.config.load_gateway_config",
+            return_value=self._email_cfg(),
+        ), patch(
+            "cron.scheduler.load_config",
+            return_value={"cron": {"wrap_response": False}},
+        ), patch(
+            "tools.send_message_tool._send_to_platform",
+            new=make_pending_send,
+        ), patch(
+            "asyncio.run",
+            side_effect=RuntimeError("no running loop"),
+        ), patch(
+            "concurrent.futures.ThreadPoolExecutor"
+        ) as mock_pool_cls:
+            mock_pool_cls.return_value.submit.side_effect = RuntimeError(
+                "executor unavailable"
+            )
+
+            result = _deliver_result(job, "Report content")
+
+        assert result is not None
+        assert "executor unavailable" in result
+        assert len(pending_sends) == 1
+        assert pending_sends[0].closed is True
+
 
 class TestSetCronSessionTitle:
     """Robust cron session titling: #50535/#50536/#50537."""
@@ -1899,5 +1946,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-

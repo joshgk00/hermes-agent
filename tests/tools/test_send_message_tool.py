@@ -1700,6 +1700,46 @@ class TestSendViaAdapterStandaloneFallback:
 
         assert result == {"error": "Plugin standalone send failed: boom!"}
 
+
+    @pytest.mark.asyncio
+    async def test_stopped_gateway_loop_falls_back_to_standalone(self, monkeypatch):
+        """A stale live runner must not strand a send on its stopped loop."""
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        platform = _FakePlatform("fakeplatform")
+        stopped_loop = asyncio.new_event_loop()
+        live_send_called = False
+
+        class Adapter:
+            async def send(self, **kwargs):
+                nonlocal live_send_called
+                live_send_called = True
+                return SimpleNamespace(success=True, message_id="live-id")
+
+        async def standalone_send(pconfig, chat_id, message, **kwargs):
+            return {"success": True, "message_id": "standalone-id"}
+
+        runner = SimpleNamespace(
+            adapters={platform: Adapter()},
+            _gateway_loop=stopped_loop,
+        )
+        platform_registry.register(self._make_entry(standalone_send))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+            result = await _send_via_adapter(
+                platform,
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "hi",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+            stopped_loop.close()
+
+        assert result == {"success": True, "message_id": "standalone-id"}
+        assert live_send_called is False
+
 # ---------------------------------------------------------------------------
 # _check_send_message — availability gating
 # ---------------------------------------------------------------------------

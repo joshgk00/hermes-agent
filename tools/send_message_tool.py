@@ -728,14 +728,45 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                adapter_coro = adapter.send(
+                    chat_id=chat_id,
+                    content=chunk,
+                    metadata=metadata,
+                )
+                gateway_loop = getattr(runner, "_gateway_loop", None)
+                current_loop = asyncio.get_running_loop()
+                if gateway_loop is not None and gateway_loop is not current_loop:
+                    # Persistent adapter clients (aiohttp, E2EE sessions, etc.)
+                    # must execute on the gateway loop that created them.
+                    from agent.async_utils import safe_schedule_threadsafe
+
+                    future = None
+                    if getattr(gateway_loop, "is_running", lambda: False)():
+                        future = safe_schedule_threadsafe(
+                            adapter_coro,
+                            gateway_loop,
+                            logger=logger,
+                            log_message=(
+                                f"Failed to schedule {platform_name} send on "
+                                "the live gateway loop"
+                            ),
+                        )
+                    else:
+                        adapter_coro.close()
+                    if future is None:
+                        adapter = None
+                    else:
+                        result = await asyncio.wrap_future(future)
+                else:
+                    result = await adapter_coro
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
+            if adapter is not None:
+                if result.success:
+                    return {"success": True, "message_id": result.message_id}
+                return {"error": f"Adapter send failed: {result.error}"}
 
     entry = None
     try:

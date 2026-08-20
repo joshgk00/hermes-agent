@@ -380,6 +380,19 @@ class TestMarkJobRun:
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
 
+    def test_successful_delivery_clears_stale_delivery_error(self, tmp_cron_dir):
+        """A later successful delivery must clear the prior transport error."""
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=True, delivery_error="send failed: 502")
+        assert get_job(job["id"])["last_delivery_error"] == "send failed: 502"
+
+        mark_job_run(job["id"], success=True, delivery_error=None)
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+        assert updated["last_error"] is None
+        assert updated["last_delivery_error"] is None
+
 
     def test_recurring_cron_not_disabled_when_croniter_missing(self, tmp_cron_dir, monkeypatch):
         """Regression test for issue #16265.

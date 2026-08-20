@@ -10,7 +10,105 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import asyncio
+import threading
+from types import SimpleNamespace
+
 import cron.scheduler as s
+import pytest
+
+
+@pytest.fixture
+def gateway_loop():
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop_ready.set()
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    assert loop_ready.wait(timeout=2)
+    try:
+        yield loop
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=2)
+        loop.close()
+
+
+class _LoopBoundMattermostAdapter:
+    splits_long_messages = True
+
+    def __init__(self, gateway_loop, outcomes=(True,)):
+        self.gateway_loop = gateway_loop
+        self.outcomes = iter(outcomes)
+        self.sends = []
+
+    async def send(self, chat_id, content, metadata=None):
+        if asyncio.get_running_loop() is not self.gateway_loop:
+            raise RuntimeError("Timeout context manager should be used inside a task")
+        self.sends.append((chat_id, content, metadata))
+        outcome = next(self.outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return SimpleNamespace(
+            success=bool(outcome),
+            message_id="mattermost-post-1" if outcome else None,
+            error=None if outcome else "Mattermost rejected post",
+        )
+
+
+def _patch_mattermost_run(monkeypatch, gateway_loop, adapter):
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    runner = SimpleNamespace(
+        adapters={Platform.MATTERMOST: adapter},
+        _gateway_loop=gateway_loop,
+    )
+    config = GatewayConfig(
+        platforms={
+            Platform.MATTERMOST: PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={"url": "https://mattermost.invalid"},
+            )
+        }
+    )
+    marked = []
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(s, "load_config", lambda: {"cron": {"wrap_response": False}})
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        s, "create_execution", lambda _job_id, source: {"id": "execution-1"}
+    )
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda _job, *, defer_agent_teardown=None: (
+            True,
+            "agent output",
+            "cron result",
+            None,
+        ),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda _job_id, _output: "/tmp/out")
+    monkeypatch.setattr(s, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(s, "_consume_interrupted_flag", lambda _job_id: False)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda job_id, success, error=None, delivery_error=None: marked.append(
+            (job_id, success, error, delivery_error)
+        ),
+    )
+    monkeypatch.setattr(s, "finish_execution", lambda *args, **kwargs: None)
+    return runner, marked
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
@@ -66,6 +164,74 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+@pytest.mark.parametrize(
+    ("deliver", "expected_channel"),
+    [
+        ("mattermost:explicit-channel", "explicit-channel"),
+        ("mattermost", "home-channel"),
+    ],
+)
+def test_manual_mattermost_delivery_uses_live_gateway_loop(
+    monkeypatch, gateway_loop, deliver, expected_channel
+):
+    """A manual run must not await a live adapter on asyncio.run's loop."""
+    adapter = _LoopBoundMattermostAdapter(gateway_loop)
+    _, marked = _patch_mattermost_run(monkeypatch, gateway_loop, adapter)
+    if deliver == "mattermost":
+        monkeypatch.setenv("MATTERMOST_HOME_CHANNEL", "home-channel")
+
+    assert s.run_one_job(
+        {
+            "id": "manual-mattermost",
+            "name": "Manual Mattermost",
+            "deliver": deliver,
+        }
+    )
+
+    assert marked == [("manual-mattermost", True, None, None)]
+    assert adapter.sends and adapter.sends[0][0] == expected_channel
+
+
+def test_scheduled_mattermost_delivery_uses_supplied_gateway_loop(
+    monkeypatch, gateway_loop
+):
+    """Scheduled fires retain the existing adapters+loop live-router path."""
+    adapter = _LoopBoundMattermostAdapter(gateway_loop)
+    runner, marked = _patch_mattermost_run(monkeypatch, gateway_loop, adapter)
+
+    assert s.run_one_job(
+        {
+            "id": "scheduled-mattermost",
+            "name": "Scheduled Mattermost",
+            "deliver": "mattermost:scheduled-channel",
+        },
+        adapters=runner.adapters,
+        loop=gateway_loop,
+    )
+
+    assert marked == [("scheduled-mattermost", True, None, None)]
+    assert adapter.sends and adapter.sends[0][0] == "scheduled-channel"
+
+
+def test_mattermost_delivery_failure_does_not_overwrite_agent_success(
+    monkeypatch, gateway_loop
+):
+    """Delivery failure is separate from a successful agent execution."""
+    adapter = _LoopBoundMattermostAdapter(gateway_loop, outcomes=(False,))
+    _, marked = _patch_mattermost_run(monkeypatch, gateway_loop, adapter)
+
+    assert s.run_one_job(
+        {
+            "id": "failed-mattermost-delivery",
+            "name": "Failed Mattermost Delivery",
+            "deliver": "mattermost:channel-1",
+        }
+    )
+
+    assert marked[0][:3] == ("failed-mattermost-delivery", True, None)
+    assert "Mattermost rejected post" in marked[0][3]
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -107,5 +273,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
-
