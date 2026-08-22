@@ -36,3 +36,27 @@ class TestMatrixExecApprovalReactions:
         mock_resolve.assert_called_once_with("sess-1", "once")
         assert "$target" not in adapter._approval_prompts_by_event
         assert "sess-1" not in adapter._approval_prompt_by_session
+
+    @pytest.mark.asyncio
+    async def test_red_x_reaction_denies_pending_approval(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@liizfq:liizfq.top")
+        from plugins.platforms.matrix.adapter import MatrixAdapter, _MatrixApprovalPrompt
+
+        adapter = MatrixAdapter(PlatformConfig(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.org"}))
+        adapter._user_id = "@bot:example.org"
+        adapter._approval_prompts_by_event["$target"] = _MatrixApprovalPrompt(
+            session_key="sess-1", chat_id="!room:example.org", message_id="$target"
+        )
+        adapter._approval_prompt_by_session["sess-1"] = "$target"
+
+        event = types.SimpleNamespace(
+            sender="@liizfq:liizfq.top",
+            event_id="$react-deny",
+            room_id="!room:example.org",
+            content={"m.relates_to": {"event_id": "$target", "key": "❌"}},
+        )
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._on_reaction(event)
+
+        mock_resolve.assert_called_once_with("sess-1", "deny")
